@@ -83,12 +83,12 @@
               [[target]]
               name = "Fedora 5.15"
               kernel = "${kernel_5_15.out}/bzImage"
-              command = "pushd /tmp && /home/javierhonduco/code/lightswitch/target/x86_64-unknown-linux-gnu/debug/lightswitch --duration 2"
+              command = "target/x86_64-unknown-linux-gnu/debug/lightswitch --duration 2"
 
               [[target]]
               name = "Fedora 6.6"
               kernel = "${kernel_6_6.out}/bzImage"
-              command = "pushd /tmp && /home/javierhonduco/code/lightswitch/target/x86_64-unknown-linux-gnu/debug/lightswitch --duration 2"
+              command = "target/x86_64-unknown-linux-gnu/debug/lightswitch --duration 2"
             '';
             nativeBuildInputs = [ vmtest kernel_5_15 kernel_6_6 ];
             installPhase = ''
@@ -104,9 +104,9 @@
             dontUnpack = true;
 
             src = pkgs.writeText "run-vmtests" ''
+              cargo build
               ${vmtest}/bin/vmtest --config ${vmtest-create-config}/vmtest.toml
             '';
-            # propagatedBuildInputs = [ pkgs.qemu ];
             nativeBuildInputs = [ vmtest-create-config ];
             installPhase = ''
               mkdir -p $out/bin
@@ -119,6 +119,10 @@
         with pkgs;
         {
           formatter = pkgs.nixpkgs-fmt;
+          packages = rec {
+            run-vm-tests = runvmtests;
+          };
+
 
           devShells.default = mkShell rec {
             # https://discourse.nixos.org/t/how-to-add-pkg-config-file-to-a-nix-package/8264/4
@@ -132,7 +136,6 @@
               llvmPackages_16.libcxx
               llvmPackages_16.libclang
               llvmPackages_16.lld
-              runvmtests
               # Debugging
               strace
               gdb
