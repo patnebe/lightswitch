@@ -327,3 +327,297 @@ impl<'a> UnwindInfoBuilder<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::profiler::{in_memory_unwind_info, SHARD_CAPACITY};
+
+    use super::*;
+    use crate::bpf::profiler_bindings::chunk_info_t;
+    use crate::bpf::profiler_bindings::stack_unwind_row_t;
+    use crate::profiler::remove_redundant;
+    use crate::profiler::remove_unnecesary_markers;
+    use std::collections::HashMap;
+
+    fn oracle_binary_search(
+        unwind_info: &Vec<stack_unwind_row_t>,
+        pc: u64,
+    ) -> Option<stack_unwind_row_t> {
+        let insertion_index = unwind_info.binary_search_by(|el| {
+            // Prevent unaligned accesses.
+            let this_pc = el.pc;
+            this_pc.cmp(&pc)
+        });
+
+        match insertion_index {
+            Ok(index) => Some(unwind_info[index]),
+            Err(index) => {
+                if index > 0 && index <= unwind_info.len() {
+                    Some(unwind_info[index - 1])
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn our_binary_search(
+        unwind_info: &Vec<stack_unwind_row_t>,
+        pc: u64,
+    ) -> Option<stack_unwind_row_t> {
+        let mut left: u32 = 0;
+        let mut right: u32 = unwind_info.len() as u32;
+        let mut found = 0xFFFFFFFF;
+
+        loop {
+            if left >= right {
+                if found == 0xFFFFFFFF {
+                    return None;
+                }
+                if found >= unwind_info.len() {
+                    return None;
+                } else {
+                    return Some(unwind_info[found]);
+                }
+            }
+            let mid = (left + right) / 2;
+            let this_pc = unwind_info[mid as usize].pc;
+            if this_pc <= pc {
+                found = mid as usize;
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+    }
+
+    #[test]
+    fn test_binary_search() {
+        let mut unwind_info: Vec<_> = (0..SHARD_CAPACITY)
+            .map(|i| stack_unwind_row_t {
+                pc: 100 + i as u64,
+                cfa_type: if i % 2 == 0 {
+                    CfaType::StackPointerOffset
+                } else {
+                    CfaType::FramePointerOffset
+                } as u8,
+                cfa_offset: if i % 3 == 0 { 8 } else { 16 },
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            })
+            .collect::<Vec<_>>();
+
+        unwind_info.sort_by(|a, b| {
+            let a_pc = a.pc;
+            let b_pc = b.pc;
+            a_pc.cmp(&b_pc)
+        });
+        let unwind_info = remove_unnecesary_markers(&unwind_info);
+        let unwind_info = remove_redundant(&unwind_info);
+
+        let mut first_pc = unwind_info[0].pc;
+        let mut last_pc = unwind_info[unwind_info.len() - 1].pc;
+
+        // Test edge conditions.
+        if first_pc >= 2 {
+            first_pc -= 2;
+        }
+        last_pc += 30;
+
+        for pc in first_pc..last_pc {
+            let oracle = oracle_binary_search(&unwind_info, pc);
+            let ours = our_binary_search(&unwind_info, pc);
+
+            if let Some(oo) = oracle {
+                if oo.cfa_type == CfaType::EndFdeMarker as u8 {
+                    continue;
+                }
+            }
+            if let Some(oo) = ours {
+                if oo.cfa_type == CfaType::EndFdeMarker as u8 {
+                    continue;
+                }
+            }
+
+            if oracle != ours {
+                println!("{:?} {:?}", oracle, ours);
+            }
+            assert_eq!(oracle, ours);
+        }
+
+        // Empty case.
+        let unwind_info = Vec::new();
+        let pc = 0;
+
+        let oracle = oracle_binary_search(&unwind_info, pc);
+        let ours = our_binary_search(&unwind_info, pc);
+        assert_eq!(oracle, ours);
+    }
+
+    fn search_in_shards(
+        pc: u64,
+        shards: &HashMap<u64, Vec<stack_unwind_row_t>>,
+        chunks: &Vec<chunk_info_t>,
+    ) -> Option<stack_unwind_row_t> {
+        let mut found_chunk: Option<chunk_info_t> = None;
+
+        for chunk in chunks {
+            // inclusive range [low_pc, high_pc]
+            if chunk.low_pc <= pc && pc <= chunk.high_pc {
+                found_chunk = Some(*chunk);
+                break;
+            }
+        }
+
+        if let Some(le_chunk) = found_chunk {
+            let shard: &Vec<_> = shards.get(&le_chunk.shard_index).unwrap();
+            let s: Vec<_> =
+                shard[(le_chunk.low_index as usize)..(le_chunk.high_index as usize)].to_vec();
+            return our_binary_search(&s, pc);
+        }
+
+        None
+    }
+
+    #[test]
+    fn test_sharding_and_chunking_chunked_between_frames() {
+        let mut unwind_info: Vec<_> = vec![
+            stack_unwind_row_t {
+                pc: 10,
+                cfa_type: CfaType::StackPointerOffset as u8,
+                cfa_offset: 1,
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            },
+            stack_unwind_row_t {
+                pc: 20,
+                cfa_type: CfaType::StackPointerOffset as u8,
+                cfa_offset: 2,
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            },
+            stack_unwind_row_t {
+                pc: 30,
+                cfa_type: CfaType::EndFdeMarker as u8,
+                cfa_offset: 3,
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            },
+            stack_unwind_row_t {
+                pc: 40,
+                cfa_type: CfaType::StackPointerOffset as u8,
+                cfa_offset: 3,
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            },
+            stack_unwind_row_t {
+                pc: 43,
+                cfa_type: CfaType::EndFdeMarker as u8,
+                cfa_offset: 3,
+                rbp_type: RbpType::CfaOffset as u8,
+                rbp_offset: 0,
+            },
+        ];
+
+        unwind_info.sort_by(|a, b| {
+            let a_pc = a.pc;
+            let b_pc = b.pc;
+            a_pc.cmp(&b_pc)
+        });
+
+        for shard_size in 1..10 {
+            test_sharding_and_chunking_impl(&unwind_info, shard_size);
+        }
+    }
+
+    //#[test]
+    fn test_sharding_and_chunking_binary() {
+        let mut unwind_info = in_memory_unwind_info("../testdata/vendored/amd64/redpanda").unwrap();
+        unwind_info.sort_by(|a, b| {
+            let a_pc = a.pc;
+            let b_pc = b.pc;
+            a_pc.cmp(&b_pc)
+        });
+        let unwind_info = remove_unnecesary_markers(&unwind_info);
+        let unwind_info = remove_redundant(&unwind_info);
+
+        test_sharding_and_chunking_impl(&unwind_info, 305_123);
+    }
+
+    fn test_sharding_and_chunking_impl(unwind_info: &Vec<stack_unwind_row_t>, shard_size: usize) {
+        assert!(shard_size > 0);
+        assert!(unwind_info[unwind_info.len() - 1].cfa_type == CfaType::EndFdeMarker as u8);
+
+        let mut first_pc = unwind_info[0].pc;
+        let mut last_pc = unwind_info[unwind_info.len() - 1].pc;
+
+        // Test edge conditions.
+        if first_pc >= 1 {
+            first_pc -= 2;
+        }
+        last_pc += 30;
+
+        let mut live_shard: Vec<stack_unwind_row_t> = Vec::new();
+        let mut shard_index = 0_u64;
+
+        let mut shards: HashMap<u64, Vec<stack_unwind_row_t>> = HashMap::new();
+        let mut chunks: Vec<chunk_info_t> = Vec::new();
+
+        let mut current: &[stack_unwind_row_t];
+        let mut rest: &[stack_unwind_row_t] = &unwind_info[..];
+
+        loop {
+            if rest.len() == 0 {
+                break;
+            }
+
+            if live_shard.len() == shard_size {
+                // "persist"
+                shards.insert(shard_index, live_shard.clone());
+                // create new shard
+                shard_index += 1;
+                // reset live shard
+                live_shard = Vec::new();
+            }
+
+            let length: usize = std::cmp::min(shard_size.abs_diff(live_shard.len()), rest.len());
+            current = &rest[..length];
+            rest = &rest[length..];
+
+            let low_index = live_shard.len() as u64;
+            live_shard.append(&mut current.to_vec());
+            let high_index = live_shard.len() as u64;
+
+            chunks.push(chunk_info_t {
+                low_pc: current[0].pc,
+                high_pc: if rest.len() > 0 {
+                    rest[0].pc - 1
+                } else {
+                    current[current.len() - 1].pc
+                },
+                shard_index: shard_index,
+                low_index: low_index,
+                high_index: high_index,
+            });
+        }
+
+        // insert current live shard
+        shards.insert(shard_index, live_shard.clone());
+
+        for pc in first_pc..last_pc {
+            let oracle = oracle_binary_search(&unwind_info, pc);
+            let ours = search_in_shards(pc, &shards, &chunks);
+
+            // search_in_shards can tell when a PC is not contained
+            // at all, while the binary search method over the whole
+            // unwind info will return the last element
+            if oracle == Some(unwind_info[unwind_info.len() - 1]) {
+                if oracle.unwrap().cfa_type == CfaType::EndFdeMarker as u8 {
+                    continue;
+                }
+            }
+
+            assert_eq!(oracle, ours, "program counter {}", pc);
+        }
+    }
+}

@@ -26,7 +26,7 @@ tracing = "*"
 tracing-subscriber = "*"
 chrono = "*"
 inferno = "*"
-
+rand = "*"
 
 [build-dependencies]
 bindgen = "*"

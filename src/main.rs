@@ -11,7 +11,8 @@ use tracing_subscriber::FmtSubscriber;
 use lightswitch::object::build_id;
 use lightswitch::profiler::Collector;
 use lightswitch::profiler::Profiler;
-use lightswitch::unwind_info::{compact_printing_callback, UnwindInfoBuilder};
+use lightswitch::profiler::{in_memory_unwind_info, remove_redundant, remove_unnecesary_markers};
+use lightswitch::unwind_info::UnwindInfoBuilder;
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -46,7 +47,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     if let Some(path) = args.show_unwind_info {
-        UnwindInfoBuilder::with_callback(&path, compact_printing_callback)?.process()?;
+        // UnwindInfoBuilder::with_callback(&path, compact_printing_callback)?.process()?;
+
+        let mut unwind_info = in_memory_unwind_info(&path).unwrap();
+        unwind_info.sort_by(|a, b| {
+            let a_pc = a.pc;
+            let b_pc = b.pc;
+            a_pc.cmp(&b_pc)
+        });
+        let unwind_info = remove_unnecesary_markers(&unwind_info);
+        let unwind_info = remove_redundant(&unwind_info);
+
+        for compact_row in unwind_info {
+            let pc = compact_row.pc;
+            let cfa_type = compact_row.cfa_type;
+            let rbp_type = compact_row.rbp_type;
+            let cfa_offset = compact_row.cfa_offset;
+            let rbp_offset = compact_row.rbp_offset;
+            println!(
+                "pc: {:x} cfa_type: {:<2} rbp_type: {:<2} cfa_offset: {:<4} rbp_offset: {:<4}",
+                pc, cfa_type, rbp_type, cfa_offset, rbp_offset
+            );
+        }
+
         return Ok(());
     }
 
