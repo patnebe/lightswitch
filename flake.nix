@@ -18,6 +18,7 @@
           pkgs = import nixpkgs {
             inherit system overlays;
           };
+          zstd-static = (pkgs.zstd.override { static = true; });
         in
         with pkgs;
         {
@@ -53,7 +54,7 @@
             ];
 
             LIBCLANG_PATH = lib.makeLibraryPath [ llvmPackages_16.libclang ];
-            LD_LIBRARY_PATH = lib.makeLibraryPath [ zlib.static elfutils ];
+            LD_LIBRARY_PATH = lib.makeLibraryPath [ zlib.static elfutils zstd-static];
           };
         }
       );
