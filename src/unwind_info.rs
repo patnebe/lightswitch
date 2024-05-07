@@ -162,7 +162,7 @@ pub struct UnwindInfoBuilder<'a> {
 }
 
 impl<'a> UnwindInfoBuilder<'a> {
-    pub fn with_callback(
+    pub fn with_file_callback(
         path: &'a str,
         callback: impl FnMut(&UnwindData) + 'a,
     ) -> anyhow::Result<Self> {
@@ -179,7 +179,7 @@ impl<'a> UnwindInfoBuilder<'a> {
         let mut result = Vec::new();
         let mut last_function_end_addr: Option<u64> = None;
 
-        let builder = UnwindInfoBuilder::with_callback(path, |unwind_data| {
+        let builder = UnwindInfoBuilder::with_file_callback(path, |unwind_data| {
             match unwind_data {
                 UnwindData::Function(_, end_addr) => {
                     // Add a function marker for the previous function.
@@ -443,7 +443,7 @@ pub fn in_memory_unwind_info(path: &str) -> anyhow::Result<Vec<stack_unwind_row_
     let mut last_function_end_addr: Option<u64> = None;
     let mut last_row = None;
 
-    let builder = UnwindInfoBuilder::with_callback(path, |unwind_data| {
+    let builder = UnwindInfoBuilder::with_file_callback(path, |unwind_data| {
         match unwind_data {
             UnwindData::Function(_, end_addr) => {
                 // Add the end addr when we hit a new func

@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let objet_file = ObjectFile::new(&PathBuf::from(path.clone())).unwrap();
         println!("build id {:?}", objet_file.build_id());
         let unwind_info: Result<UnwindInfoBuilder<'_>, anyhow::Error> =
-            UnwindInfoBuilder::with_callback(&path, |_| {});
+            UnwindInfoBuilder::with_file_callback(&path, |_| {});
         println!("unwind info {:?}", unwind_info.unwrap().process());
 
         return Ok(());

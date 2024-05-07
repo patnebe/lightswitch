@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use libbpf_rs::num_possible_cpus;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::skel::{OpenSkel, Skel};
@@ -149,6 +149,36 @@ impl Default for Profiler<'_> {
     fn default() -> Self {
         Self::new(false, Duration::MAX, 19)
     }
+}
+
+use std::os::unix::fs::FileExt;
+
+fn fetch_vdso_info(
+    pid: i32,
+    start_addr: u64,
+    end_addr: u64,
+    offset: u64,
+) -> Result<(BuildId, PathBuf)> {
+    // Read raw memory
+    let file = fs::File::open(format!("/proc/{}/mem", pid))?;
+    let size = end_addr - start_addr;
+    let mut buf: Vec<u8> = vec![0; size as usize];
+    file.read_exact_at(&mut buf, start_addr + offset)?;
+
+    // Write to a temporary place
+    let dumped_vdso = PathBuf::from("/tmp/lightswitch-vdso");
+    fs::write(&dumped_vdso, &buf)?;
+
+    // Pass that to the object parser
+    // - extract build id
+    let object = ObjectFile::new(&dumped_vdso)?;
+    println!("buildID: {:?}", object.build_id()?);
+
+    // Extract unwind information
+    // let unwind_info = in_memory_unwind_info(&dumped_vdso.to_string_lossy());
+    // println!("unwind info: {:?}", unwind_info);
+
+    Ok((object.build_id()?, dumped_vdso))
 }
 
 impl Profiler<'_> {
@@ -1011,11 +1041,11 @@ impl Profiler<'_> {
                         unwinder,
                     });
 
-                    let mut my_lock = object_files_clone.lock().expect("lock");
+                    let mut object_files = object_files_clone.lock().expect("lock");
 
                     match object_file.elf_load() {
                         Ok(elf_load) => {
-                            my_lock.insert(
+                            object_files.insert(
                                 build_id,
                                 ObjectFileInfo {
                                     path: abs_path,
@@ -1043,21 +1073,37 @@ impl Profiler<'_> {
                         unwinder: Unwinder::Unknown,
                     });
                 }
-                procfs::process::MMapPath::Vsyscall
-                | procfs::process::MMapPath::Vdso
-                | procfs::process::MMapPath::Vsys(_)
-                | procfs::process::MMapPath::Vvar => {
-                    mappings.push(ExecutableMapping {
-                        build_id: None,
-                        kind: MappingType::Vdso,
-                        start_addr: map.address.0,
-                        end_addr: map.address.1,
-                        offset: map.offset,
-                        load_address: 0,
-                        unwinder: Unwinder::NativeFramePointers,
-                    });
+                procfs::process::MMapPath::Vdso | procfs::process::MMapPath::Vsyscall => {
+                    if let Ok((build_id, vdso_path)) =
+                        fetch_vdso_info(pid, map.address.0, map.address.1, map.offset)
+                    {
+                        let mut object_files = object_files_clone.lock().expect("lock");
+                        object_files.insert(
+                            build_id.clone(),
+                            ObjectFileInfo {
+                                path: vdso_path.clone(),
+                                file: std::fs::File::open(vdso_path)?,
+                                load_offset: 0,
+                                load_vaddr: 0,
+                                is_dyn: false,
+                                main_bin: false,
+                            },
+                        );
+                        mappings.push(ExecutableMapping {
+                            build_id: Some(build_id),
+                            kind: MappingType::FileBacked, // We can cheat now :).
+                            start_addr: map.address.0,
+                            end_addr: map.address.1,
+                            offset: map.offset,
+                            load_address: 0,
+                            unwinder: Unwinder::NativeFramePointers,
+                        });
+                    }
                 }
-                _ => {}
+                procfs::process::MMapPath::Vsys(_) | procfs::process::MMapPath::Vvar => {}
+                _ => {
+                    // skip these mappings
+                }
             }
         }
 
