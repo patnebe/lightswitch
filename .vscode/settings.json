@@ -1,0 +1,5 @@
+{
+    "files.associations": {
+        "vmlinux_arm64.h": "c"
+    }
+}

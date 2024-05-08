@@ -6,10 +6,12 @@ use object::{Object, ObjectSection, Section};
 use std::fs::File;
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::span;
 
 use crate::bpf::profiler_bindings::stack_unwind_row_t;
 use anyhow::anyhow;
-use tracing::{error, span, Level};
+use tracing::error;
+use tracing::Level;
 
 #[repr(u8)]
 pub enum CfaType {
@@ -29,6 +31,7 @@ enum RbpType {
     Register = 2,
     Expression = 3,
     UndefinedReturnAddress = 4,
+    OffsetDidNotFit = 5,
 }
 
 #[repr(u16)]
@@ -88,8 +91,12 @@ pub enum Error {
     ErrorNoTextSection,
 }
 
-const RBP_X86: gimli::Register = gimli::Register(6);
-const RSP_X86: gimli::Register = gimli::Register(7);
+/* const RBP_X86: gimli::Register = gimli::Register(6);
+const RSP_X86: gimli::Register = gimli::Register(7); */
+
+const ARM64_FP: gimli::Register = gimli::Register(29);
+const ARM64_SP: gimli::Register = gimli::Register(31);
+
 
 pub fn end_of_function_marker(last_addr: u64) -> CompactUnwindRow {
     CompactUnwindRow {
@@ -309,9 +316,9 @@ impl<'a> UnwindInfoBuilder<'a> {
                         compact_row.pc = row.start_address();
                         match row.cfa() {
                             CfaRule::RegisterAndOffset { register, offset } => {
-                                if register == &RBP_X86 {
+                                if register == &ARM64_FP {
                                     compact_row.cfa_type = CfaType::FramePointerOffset as u8;
-                                } else if register == &RSP_X86 {
+                                } else if register == &ARM64_SP {
                                     compact_row.cfa_type = CfaType::StackPointerOffset as u8;
                                 } else {
                                     compact_row.cfa_type = CfaType::UnsupportedRegisterOffset as u8;
@@ -339,12 +346,19 @@ impl<'a> UnwindInfoBuilder<'a> {
                             }
                         };
 
-                        match row.register(RBP_X86) {
+                        match row.register(ARM64_FP) {
                             gimli::RegisterRule::Undefined => {}
                             gimli::RegisterRule::Offset(offset) => {
                                 compact_row.rbp_type = RbpType::CfaOffset as u8;
-                                compact_row.rbp_offset =
-                                    i16::try_from(offset).expect("convert rbp offset");
+
+                                match i16::try_from(offset) {
+                                    Ok(off) => {
+                                        compact_row.rbp_offset = off;
+                                    }
+                                    Err(_) => {
+                                        compact_row.rbp_type = RbpType::OffsetDidNotFit as u8;
+                                    }
+                                }
                             }
                             gimli::RegisterRule::Register(_reg) => {
                                 compact_row.rbp_type = RbpType::Register as u8;
