@@ -97,7 +97,6 @@ const RSP_X86: gimli::Register = gimli::Register(7); */
 const ARM64_FP: gimli::Register = gimli::Register(29);
 const ARM64_SP: gimli::Register = gimli::Register(31);
 
-
 pub fn end_of_function_marker(last_addr: u64) -> CompactUnwindRow {
     CompactUnwindRow {
         pc: last_addr,
@@ -256,7 +255,8 @@ impl<'a> UnwindInfoBuilder<'a> {
 
         let eh_frame_data = &eh_frame_section.uncompressed_data()?;
 
-        let eh_frame = EhFrame::new(eh_frame_data, endian);
+        let mut eh_frame = EhFrame::new(eh_frame_data, endian);
+        eh_frame.set_vendor(gimli::Vendor::AArch64);
         let mut entries_iter = eh_frame.entries(&bases);
 
         let mut cur_cie = None;
