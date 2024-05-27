@@ -99,8 +99,10 @@ pub fn end_of_function_marker(last_addr: u64) -> CompactUnwindRow {
     }
 }
 
+// NOTE: Why do we have two variants of unwind data?
 pub enum UnwindData {
     // Initial, end addresses
+    // NOTE: Initial and end address of what?? A given function?
     Function(u64, u64),
     Instruction(CompactUnwindRow),
 }
@@ -156,12 +158,19 @@ pub fn log_unwind_info_sections(path: &PathBuf) -> Result<()> {
 
 // Ideally this interface should do most of the preparatory work in the
 // constructor but this is complicated by the various lifetimes.
+
+// NOTE: What are the various lifetimes being referred to here?
+// What is this used for? Building unwind info for a given executable at a given path?
 pub struct UnwindInfoBuilder<'a> {
     mmap: Mmap,
     callback: Box<dyn FnMut(&UnwindData) + 'a>,
 }
 
+// Initializes a struct
 impl<'a> UnwindInfoBuilder<'a> {
+    // NOTE: Does this just mmap what located at the supplied path
+    // and then uses it to initialize the UnwindInfoBuilder struct??
+
     pub fn with_callback(
         path: &'a str,
         callback: impl FnMut(&UnwindData) + 'a,
@@ -175,15 +184,30 @@ impl<'a> UnwindInfoBuilder<'a> {
         })
     }
 
+    // NOTE: What does this method do?
+    // Call the unwind info builder, get some data,
+    // process each entry using a callback which
+    // uses the callback parameter to generate and add
+    // and unwindinfo row to a result table.
     pub fn to_vec(path: &str) -> anyhow::Result<Vec<CompactUnwindRow>> {
         let mut result = Vec::new();
+
+        // NOTE: Why do we need to keep track of the last function
+        // end address?
         let mut last_function_end_addr: Option<u64> = None;
 
         let builder = UnwindInfoBuilder::with_callback(path, |unwind_data| {
             match unwind_data {
+                // If a function address variant is passed into the unwindInfoBuilder callback
+                // Do some work to build the CompactUnwindRow object
                 UnwindData::Function(_, end_addr) => {
                     // Add a function marker for the previous function.
+                    // NOTE: What is a function marker?
                     if let Some(addr) = last_function_end_addr {
+                        // NOTE: there's a value for the last function end address
+                        // use that to create an unwind table entry representing
+                        // the end of a function
+                        // Why is this necessary?
                         let marker = end_of_function_marker(addr);
                         let row = CompactUnwindRow {
                             pc: marker.pc,
@@ -196,6 +220,9 @@ impl<'a> UnwindInfoBuilder<'a> {
                     }
                     last_function_end_addr = Some(*end_addr);
                 }
+                // If it is an unwindrow struct, simply add a copy
+                // of the struct to the unwind info table --
+                // which is vector of unwind info structs. 
                 UnwindData::Instruction(compact_row) => {
                     let row = CompactUnwindRow {
                         pc: compact_row.pc,
@@ -228,19 +255,25 @@ impl<'a> UnwindInfoBuilder<'a> {
     }
 
     pub fn process(mut self) -> Result<(), anyhow::Error> {
+        // TODO: Is this always guaranteed to succeed?
         let object_file = object::File::parse(&self.mmap[..])?;
+        
+        // NOTE: Get the eh_frame section
         let eh_frame_section = object_file
             .section_by_name(".eh_frame")
             .ok_or(Error::ErrorNoEhFrameSection)?;
-
+        
+        // NOTE: Get the text section
         let text = object_file
             .section_by_name(".text")
             .ok_or(Error::ErrorNoTextSection)?;
 
+        // NOTE: Get the addresses to be used as the base for the DW_EH_PE_xxx encoded pointers
         let bases = gimli::BaseAddresses::default()
             .set_eh_frame(eh_frame_section.address())
             .set_text(text.address());
-
+        
+        // NOTE: Why do we need to know the endianness of the object file?
         let endian = if object_file.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {
@@ -253,16 +286,28 @@ impl<'a> UnwindInfoBuilder<'a> {
         let mut entries_iter = eh_frame.entries(&bases);
 
         let mut cur_cie = None;
-        let mut pc_and_fde_offset = Vec::new();
 
+        // This is a vector of pairs of program counter and FDE offsets
+        // NOTE: Why do we need to build this vector?
+        // NOTE: FDE offset is relative to what?
+        let mut pc_and_fde_offset = Vec::new();
+        
+        // At this point, we've loaded the object file using the object crate, 
+        // and parsed its eh_frame information using the gimli crate
+        // Next iterate over the entries in the .eh_frame section, then do what?
+        // NOTE: It looks like we're getting the FDE offsets here from the ehframe entries
         while let Ok(Some(entry)) = entries_iter.next() {
             match entry {
                 CieOrFde::Cie(cie) => {
+                    // NOTE: In what cases can there be multiple CIEs in a given object file?
                     cur_cie = Some(cie);
                 }
                 CieOrFde::Fde(partial_fde) => {
+                    // TODO: Continue from here*****
                     let fde = partial_fde.parse(|eh_frame, bases, cie_offset| {
                         if let Some(cie) = &cur_cie {
+                            // What does this mean?
+                            // NOTE: Does the CIE always have to be at offset zero from it's starting position?
                             if cie.offset() == cie_offset.0 {
                                 return Ok(cie.clone());
                             }
@@ -273,7 +318,8 @@ impl<'a> UnwindInfoBuilder<'a> {
                         }
                         cie
                     });
-
+                    
+                    // NOTE: This is the rust if let syntax
                     if let Ok(fde) = fde {
                         pc_and_fde_offset.push((fde.initial_address(), fde.offset()));
                     }
@@ -281,23 +327,39 @@ impl<'a> UnwindInfoBuilder<'a> {
             }
         }
 
+        // NOTE: A span is a period of time when execution happened with a given context
+        // It can be used used to track the interval from when a unit of work begins
+        // to when it ends.
         let span = span!(Level::DEBUG, "sort pc and fdes").entered();
+
+        // NOTE: Why do we need to sort the PC and FDEs?
+        // Also, why did we need to build up this vecotr in the first place?
         pc_and_fde_offset.sort_by_key(|(pc, _)| *pc);
         span.exit();
 
+        // TODO: Notes from the docs
+        // "To avoid re-allocating the context multiple times when evaluating multiple CFI programs,
+        // the same UnwindContext can be reused for multiple unwinds"
+        // Does this apply here as well?
         let mut ctx = Box::new(UnwindContext::new());
         for (_, fde_offset) in pc_and_fde_offset {
+            // Then now we get the actual FDEs using the offsets?
+            // Why wasn't this done at the same time as the step above?
             let fde = eh_frame.fde_from_offset(
                 &bases,
                 gimli::EhFrameOffset(fde_offset),
                 EhFrame::cie_from_offset,
             )?;
+            
 
+            // NOTE: Pass the function start and end address to the callback?
+            // What's this used for? And why is it always called?
             (self.callback)(&UnwindData::Function(
                 fde.initial_address(),
                 fde.initial_address() + fde.len(),
             ));
 
+            // NOTE: Why does a single FDE have multiple rows?
             let mut table = fde.rows(&eh_frame, &bases, &mut ctx)?;
 
             loop {

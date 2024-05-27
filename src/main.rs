@@ -142,6 +142,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Cli::parse();
 
+    // NOTE: Tried reading the code for building the unwind info
+    // I have a few questions but it's quite a lot of stuff
+    // For now, I'll just treat it as a black box
+    // and assume that it works, and I don't need to do think about it :)
     if let Some(path) = args.show_unwind_info {
         let mut unwind_info = in_memory_unwind_info(&path).unwrap();
         remove_unnecesary_markers(&mut unwind_info);
@@ -149,6 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         for compact_row in unwind_info {
             let pc = compact_row.pc;
+            // Notes: Canonical frame address
             let cfa_type = compact_row.cfa_type;
             let rbp_type = compact_row.rbp_type;
             let cfa_offset = compact_row.cfa_offset;
@@ -190,8 +195,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
 
+    // NOTE: What does the collector do??
+    // ****** Continue from here.
     let collector = Collector::new();
 
+    // NOTE: What does the profiler do??
     let mut p: Profiler<'_> = Profiler::new(
         args.libbpf_logs,
         args.bpf_logging,

@@ -144,6 +144,7 @@ struct exec_mappings_key {
 #define PREFIX_LEN (sizeof(struct exec_mappings_key) - sizeof(u32)) * 8;
 
 // A row in the stack unwinding table for x86_64.
+// Notes: Why is does this need to be aligned to 1 byte boundaries?
 typedef struct __attribute__((packed)) {
   u64 pc;
   u8 cfa_type;
