@@ -58,17 +58,17 @@ impl GlobalMetadataProvider {
             .map_err(|err| warn!("{}", err))
             .unwrap_or_default();
 
-        match self.default_system_metadata.get_metadata() {
-            Ok(default_system_labels) => {
-                labels.extend(default_system_labels);
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to retrieve default system metadata, error = {}",
-                    err
-                );
-            }
-        }
+        labels.extend(
+            self.default_system_metadata
+                .get_metadata()
+                .map_err(|err| {
+                    warn!(
+                        "Failed to retrieve default system metadata, error = {}",
+                        err
+                    )
+                })
+                .unwrap_or_default(),
+        );
 
         for provider in &self.custom_system_metadata_providers {
             match provider.get_metadata() {
