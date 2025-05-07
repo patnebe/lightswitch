@@ -175,7 +175,6 @@ typedef struct {
   native_stack_t kernel_stack;
 } raw_stack_t;
 
-
 typedef struct {
   raw_stack_t raw_stack;
 
@@ -201,32 +200,3 @@ typedef struct {
 enum program {
   PROGRAM_NATIVE_UNWINDER = 0,
 };
-
-#define BIG_CONSTANT(x) (x##LLU)
-unsigned long long hash_stack(native_stack_t *stack) {
-  const unsigned long long m = BIG_CONSTANT(0xc6a4a7935bd1e995);
-  const int r = 47;
-  const int seed = 123;
-
-  unsigned long long hash = seed ^ (stack->len * m);
-
-  for (unsigned long long i = 0; i < MAX_STACK_DEPTH; i++) {
-    // The stack is not zeroed when we initialise it, we simply
-    // set the length to zero. This is a workaround to produce
-    // the same hash for two stacks that might have garbage values
-    // after their length.
-    unsigned long long k = 0;
-    if (i < stack->len) {
-      k = stack->addresses[i];
-    }
-
-    k *= m;
-    k ^= k >> r;
-    k *= m;
-
-    hash ^= k;
-    hash *= m;
-  }
-
-  return hash;
-}
