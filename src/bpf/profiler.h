@@ -170,8 +170,14 @@ typedef struct {
 } stack_key_t;
 
 typedef struct {
+  stack_key_t    stack_key;
   native_stack_t stack;
   native_stack_t kernel_stack;
+} raw_stack_t;
+
+
+typedef struct {
+  raw_stack_t raw_stack;
 
   unsigned long long ip;
   unsigned long long sp;
@@ -179,7 +185,6 @@ typedef struct {
   unsigned long long lr;
   int tail_calls;
 
-  stack_key_t stack_key;
 } unwind_state_t;
 
 enum event_type {
