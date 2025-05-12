@@ -13,6 +13,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+volatile u64 walltime_at_system_boot_ns = 0;
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -330,6 +331,9 @@ unwind_state_t *unwind_state) {
 
   unwind_state->raw_stack.stack_key.pid = per_process_id;
   unwind_state->raw_stack.stack_key.task_id = per_thread_id;
+
+  u64 timestamp = bpf_ktime_get_boot_ns() + walltime_at_system_boot_ns;
+  unwind_state->raw_stack.stack_key.collected_at = timestamp;
 
   if (lightswitch_config.use_ring_buffers) {
     ret = bpf_ringbuf_output(&stacks_rb, &(unwind_state->raw_stack), sizeof(raw_stack_t), 0);
@@ -652,6 +656,7 @@ static __always_inline bool set_initial_state(unwind_state_t *unwind_state, bpf_
 
  unwind_state->raw_stack.stack_key.pid = 0;
  unwind_state->raw_stack.stack_key.task_id = 0;
+ unwind_state->raw_stack.stack_key.collected_at = 0;
 
   if (in_kernel(PT_REGS_IP(regs))) {
     if (!retrieve_task_registers(&unwind_state->ip, &unwind_state->sp, &unwind_state->bp, &unwind_state->lr)) {

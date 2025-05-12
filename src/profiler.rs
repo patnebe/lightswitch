@@ -324,10 +324,7 @@ impl Profiler {
         map_shapes
     }
 
-    pub fn set_profiler_map_sizes(
-        open_skel: &mut OpenProfilerSkel,
-        profiler_config: &ProfilerConfig,
-    ) {
+    pub fn init_profiler_maps(open_skel: &mut OpenProfilerSkel, profiler_config: &ProfilerConfig) {
         open_skel
             .maps
             .rate_limits
@@ -411,6 +408,10 @@ impl Profiler {
         );
     }
 
+    fn walltime_at_system_boot() -> u64 {
+        procfs::boot_time().unwrap().timestamp_nanos_opt().unwrap() as u64
+    }
+
     pub fn new(
         profiler_config: ProfilerConfig,
         stop_signal_receive: Receiver<()>,
@@ -454,26 +455,31 @@ impl Profiler {
             &mut open_skel,
             &profiler_config.native_unwind_info_bucket_sizes,
         );
-        Self::set_profiler_map_sizes(&mut open_skel, &profiler_config);
+        Self::init_profiler_maps(&mut open_skel, &profiler_config);
 
         let native_unwinder = ManuallyDrop::new(open_skel.load().expect("load skel"));
 
         // SAFETY: native_unwinder never outlives native_unwinder_open_object
-        let native_unwinder = unsafe {
+        let mut native_unwinder = unsafe {
             std::mem::transmute::<ManuallyDrop<ProfilerSkel<'_>>, ManuallyDrop<ProfilerSkel<'static>>>(
                 native_unwinder,
             )
         };
 
         info!("native unwinder BPF program loaded");
-        let native_unwinder_maps = &native_unwinder.maps;
-        let exec_mappings_fd = native_unwinder_maps.exec_mappings.as_fd();
 
         // BPF map sizes can be overriden, this is a debugging option to print the actual size once
         // the maps are created and the BPF program is loaded.
         if profiler_config.mapsize_info {
             Self::show_actual_profiler_map_sizes(&native_unwinder);
         }
+
+        let native_unwinder_maps = &mut native_unwinder.maps;
+        let exec_mappings_fd = native_unwinder_maps.exec_mappings.as_fd();
+
+        // Set baseline for calculating raw_sample wallclock collection time
+        // using offset since boot.
+        native_unwinder_maps.bss_data.walltime_at_system_boot_ns = Self::walltime_at_system_boot();
 
         let mut tracers_builder = TracersSkelBuilder::default();
         tracers_builder
@@ -740,7 +746,7 @@ impl Profiler {
         let raw_sample_send = self.raw_sample_send.clone();
 
         self.start_poll_thread(
-            "raw-samples-poll-thread",
+            "raw_samples",
             &self.native_unwinder.maps.stacks_rb,
             &self.native_unwinder.maps.stacks,
             move |data| Self::handle_stack(&raw_sample_send, data),
@@ -2117,7 +2123,9 @@ impl Profiler {
         raw_sample_send.send(raw_sample).expect("Send raw sample");
     }
 
-    fn handle_lost_stack(_cpu: i32, _count: u64) {}
+    fn handle_lost_stack(cpu: i32, count: u64) {
+        error!("lost {count} stacks on cpu {cpu}");
+    }
 
     fn handle_event(sender: &Arc<Sender<Event>>, data: &[u8]) {
         let mut event = Event::default();
@@ -2186,8 +2194,7 @@ mod tests {
             &mut open_skel,
             &profiler_config.native_unwind_info_bucket_sizes,
         );
-        Profiler::set_profiler_map_sizes(&mut open_skel, &profiler_config);
-
+        Profiler::init_profiler_maps(&mut open_skel, &profiler_config);
         let native_unwinder = open_skel.load().expect("load skel");
 
         // add and delete bpf process works

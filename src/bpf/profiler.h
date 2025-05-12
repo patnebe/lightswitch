@@ -167,6 +167,7 @@ typedef struct {
 typedef struct {
   int task_id;
   int pid;
+  u64 collected_at;
 } stack_key_t;
 
 typedef struct {
