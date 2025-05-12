@@ -120,6 +120,8 @@ const volatile struct lightswitch_config_t lightswitch_config = {
     .use_task_pt_regs_helper = false,
 };
 
+const volatile u64 walltime_at_system_boot_ns = 0;
+
 #define LOG(fmt, ...)                                                          \
   ({                                                                           \
     if (lightswitch_config.verbose_logging) {                                  \

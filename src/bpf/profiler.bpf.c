@@ -13,8 +13,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-volatile u64 walltime_at_system_boot_ns = 0;
-
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 256 * 1024 /* 256 KB */); // adjust max entries based on frequency on userspace -- todo
@@ -337,13 +335,12 @@ unwind_state_t *unwind_state) {
 
   if (lightswitch_config.use_ring_buffers) {
     ret = bpf_ringbuf_output(&stacks_rb, &(unwind_state->raw_stack), sizeof(raw_stack_t), 0);
-    
   } else {
     ret = bpf_perf_event_output(ctx, &stacks, BPF_F_CURRENT_CPU, &(unwind_state->raw_stack), sizeof(raw_stack_t));
   }
 
   if (ret < 0) {
-    bpf_printk("add_stack failed ret=%d", ret);
+    bpf_printk("add_stack failed ret=%d, use_ring_buffers=", ret);
     bump_unwind_error_failure_adding_stack();
   }
 }

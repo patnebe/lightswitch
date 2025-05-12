@@ -343,6 +343,10 @@ impl Profiler {
             .use_ring_buffers
             .write(profiler_config.use_ring_buffers);
 
+        // Set baseline for calculating raw_sample collection wall clock time
+        // using offset since boot.
+        open_skel.maps.rodata_data.walltime_at_system_boot_ns = Self::walltime_at_system_boot();
+
         let max_raw_sample_entries = Profiler::get_stacks_sampling_buffer_size(
             profiler_config.sample_freq as u32,
             profiler_config.session_duration,
@@ -460,7 +464,7 @@ impl Profiler {
         let native_unwinder = ManuallyDrop::new(open_skel.load().expect("load skel"));
 
         // SAFETY: native_unwinder never outlives native_unwinder_open_object
-        let mut native_unwinder = unsafe {
+        let native_unwinder = unsafe {
             std::mem::transmute::<ManuallyDrop<ProfilerSkel<'_>>, ManuallyDrop<ProfilerSkel<'static>>>(
                 native_unwinder,
             )
@@ -468,18 +472,14 @@ impl Profiler {
 
         info!("native unwinder BPF program loaded");
 
+        let native_unwinder_maps = &native_unwinder.maps;
+        let exec_mappings_fd = native_unwinder_maps.exec_mappings.as_fd();
+
         // BPF map sizes can be overriden, this is a debugging option to print the actual size once
         // the maps are created and the BPF program is loaded.
         if profiler_config.mapsize_info {
             Self::show_actual_profiler_map_sizes(&native_unwinder);
         }
-
-        let native_unwinder_maps = &mut native_unwinder.maps;
-        let exec_mappings_fd = native_unwinder_maps.exec_mappings.as_fd();
-
-        // Set baseline for calculating raw_sample wallclock collection time
-        // using offset since boot.
-        native_unwinder_maps.bss_data.walltime_at_system_boot_ns = Self::walltime_at_system_boot();
 
         let mut tracers_builder = TracersSkelBuilder::default();
         tracers_builder
@@ -2113,6 +2113,8 @@ impl Profiler {
     fn handle_stack(raw_sample_send: &Arc<Sender<RawSample>>, data: &[u8]) {
         let mut raw_stack = raw_stack_t::default();
         plain::copy_from_bytes(&mut raw_stack, data).expect("handle stack serde");
+
+        info!("*************** {}", raw_stack.stack_key.collected_at);
 
         let raw_sample = RawSample {
             pid: raw_stack.stack_key.pid,
