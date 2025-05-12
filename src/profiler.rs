@@ -324,7 +324,7 @@ impl Profiler {
         map_shapes
     }
 
-    pub fn init_profiler_maps(open_skel: &mut OpenProfilerSkel, profiler_config: &ProfilerConfig) {
+    pub fn setup_profiler_maps(open_skel: &mut OpenProfilerSkel, profiler_config: &ProfilerConfig) {
         open_skel
             .maps
             .rate_limits
@@ -344,7 +344,7 @@ impl Profiler {
             .write(profiler_config.use_ring_buffers);
 
         // Set baseline for calculating raw_sample collection wall clock time
-        // using offset since boot.
+        // as bpf currently only supports getting the offset since system boot.
         open_skel.maps.rodata_data.walltime_at_system_boot_ns = Self::walltime_at_system_boot();
 
         let max_raw_sample_entries = Profiler::get_stacks_sampling_buffer_size(
@@ -459,7 +459,7 @@ impl Profiler {
             &mut open_skel,
             &profiler_config.native_unwind_info_bucket_sizes,
         );
-        Self::init_profiler_maps(&mut open_skel, &profiler_config);
+        Self::setup_profiler_maps(&mut open_skel, &profiler_config);
 
         let native_unwinder = ManuallyDrop::new(open_skel.load().expect("load skel"));
 
@@ -2114,8 +2114,6 @@ impl Profiler {
         let mut raw_stack = raw_stack_t::default();
         plain::copy_from_bytes(&mut raw_stack, data).expect("handle stack serde");
 
-        info!("*************** {}", raw_stack.stack_key.collected_at);
-
         let raw_sample = RawSample {
             pid: raw_stack.stack_key.pid,
             tid: raw_stack.stack_key.task_id,
@@ -2196,7 +2194,7 @@ mod tests {
             &mut open_skel,
             &profiler_config.native_unwind_info_bucket_sizes,
         );
-        Profiler::init_profiler_maps(&mut open_skel, &profiler_config);
+        Profiler::setup_profiler_maps(&mut open_skel, &profiler_config);
         let native_unwinder = open_skel.load().expect("load skel");
 
         // add and delete bpf process works
