@@ -471,7 +471,6 @@ impl Profiler {
         };
 
         info!("native unwinder BPF program loaded");
-
         let native_unwinder_maps = &native_unwinder.maps;
         let exec_mappings_fd = native_unwinder_maps.exec_mappings.as_fd();
 

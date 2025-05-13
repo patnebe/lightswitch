@@ -22,7 +22,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
   __uint(key_size, sizeof(u32));
   __uint(value_size, sizeof(u32));
-  // adjust max entries based on frequency on userspace - todo (what does this mean?)
+  // adjust max entries based on frequency on userspace - todo
 } stacks SEC(".maps");
 
 struct {
