@@ -17,7 +17,7 @@ use crate::ksym::KsymIter;
 use crate::process::ObjectFileInfo;
 use crate::process::ProcessInfo;
 use crate::profile::{
-    AggregatedProfile, AggregatedSample, Frame, FrameAddress, RawAggregatedProfile,
+    AggregatedProfile, AggregatedSample, Frame, FrameAddress, RawAggregatedProfile, SymbolizedFrame,
 };
 use crate::usym::symbolize_native_stack_blaze;
 use lightswitch_object::ExecutableId;
@@ -62,7 +62,7 @@ pub fn to_pprof(
                 continue;
             };
 
-            let Some(mapping) = info.mappings.for_address(virtual_address) else {
+            let Some(mapping) = info.mappings.for_address(&virtual_address) else {
                 // todo: maybe append an error frame for debugging?
                 continue;
             };
@@ -71,7 +71,7 @@ pub fn to_pprof(
                 Some(obj) => {
                     let normalized_addr = kframe
                         .file_offset
-                        .or_else(|| obj.normalized_address(virtual_address, &mapping));
+                        .or_else(|| obj.normalized_address(virtual_address, mapping));
 
                     if normalized_addr.is_none() {
                         debug!("normalized address is none");
@@ -86,19 +86,22 @@ pub fn to_pprof(
                         obj.path.to_str().expect("will always be valid"), // should this be named name?,
                         &mapping
                             .build_id
+                            .as_ref()
                             .expect("this should never happen")
                             .to_string(),
                     );
 
                     let mut lines = Vec::new();
 
+                    // Right now only kallsyms-based symbolization is offered for the kernel so no
+                    // line or file names.
                     match kframe.symbolization_result {
-                        Some(Ok((name, _))) => {
-                            let (line, _) = pprof.add_line(&name);
+                        Some(Ok(SymbolizedFrame { name, .. })) => {
+                            let (line, _) = pprof.add_line(&name, None, None);
                             lines.push(line);
                         }
                         Some(Err(e)) => {
-                            let (line, _) = pprof.add_line(&e.to_string());
+                            let (line, _) = pprof.add_line(&e.to_string(), None, None);
                             lines.push(line);
                         }
                         None => {}
@@ -122,7 +125,7 @@ pub fn to_pprof(
                 continue;
             };
 
-            let Some(mapping) = info.mappings.for_address(virtual_address) else {
+            let Some(mapping) = info.mappings.for_address(&virtual_address) else {
                 // todo: maybe append an error frame for debugging?
                 continue;
             };
@@ -131,7 +134,7 @@ pub fn to_pprof(
                 Some(obj) => {
                     let normalized_addr = uframe
                         .file_offset
-                        .or_else(|| obj.normalized_address(virtual_address, &mapping));
+                        .or_else(|| obj.normalized_address(virtual_address, mapping));
 
                     if normalized_addr.is_none() {
                         debug!("normalized address is none");
@@ -140,9 +143,9 @@ pub fn to_pprof(
 
                     let normalized_addr = normalized_addr.unwrap();
 
-                    let build_id = match mapping.build_id {
+                    let build_id = match &mapping.build_id {
                         Some(build_id) => {
-                            format!("{}", build_id)
+                            format!("{build_id}")
                         }
                         None => "no-build-id".into(),
                     };
@@ -162,12 +165,17 @@ pub fn to_pprof(
                     let mut lines = vec![];
 
                     match uframe.symbolization_result {
-                        Some(Ok((name, _))) => {
-                            let (line, _) = pprof.add_line(&name);
+                        Some(Ok(SymbolizedFrame {
+                            name,
+                            inlined: _,
+                            filename,
+                            line,
+                        })) => {
+                            let (line, _) = pprof.add_line(&name, filename, line);
                             lines.push(line);
                         }
                         Some(Err(e)) => {
-                            let (line, _) = pprof.add_line(&e.to_string());
+                            let (line, _) = pprof.add_line(&e.to_string(), None, None);
                             lines.push(line);
                         }
                         None => {}
@@ -208,7 +216,7 @@ pub fn to_pprof(
 ///
 /// The frame names are separated by semicolons and the count is at the end separated with a space. We insert some synthetic
 /// frames to quickly identify the thread and process names and other pieces of metadata.
-pub fn fold_profile(profile: AggregatedProfile) -> String {
+pub fn fold_profile(profile: AggregatedProfile, only_show_function_names: bool) -> String {
     let mut folded = String::new();
 
     for sample in profile {
@@ -217,7 +225,7 @@ pub fn fold_profile(profile: AggregatedProfile) -> String {
             .clone()
             .into_iter()
             .rev()
-            .map(|e| e.to_string())
+            .map(|e| e.format_all_info(only_show_function_names))
             .collect::<Vec<String>>();
         let ustack = ustack.join(";");
         let kstack = sample
@@ -225,7 +233,7 @@ pub fn fold_profile(profile: AggregatedProfile) -> String {
             .clone()
             .into_iter()
             .rev()
-            .map(|e| format!("kernel: {}", e))
+            .map(|e| format!("kernel: {e}"))
             .collect::<Vec<String>>();
         let kstack = kstack.join(";");
         let count: String = sample.count.to_string();
@@ -240,12 +248,12 @@ pub fn fold_profile(profile: AggregatedProfile) -> String {
             if ustack.trim().is_empty() {
                 "".to_string()
             } else {
-                format!(";{}", ustack)
+                format!(";{ustack}")
             },
             if kstack.trim().is_empty() {
                 "".to_string()
             } else {
-                format!(";{}", kstack)
+                format!(";{kstack}")
             },
             count
         )
@@ -322,7 +330,7 @@ pub fn fetch_symbols_for_profile(
         };
 
         for frame in &sample.ustack {
-            let Some(mapping) = info.mappings.for_address(frame.virtual_address) else {
+            let Some(mapping) = info.mappings.for_address(&frame.virtual_address) else {
                 continue;
             };
 
@@ -354,7 +362,7 @@ pub fn fetch_symbols_for_profile(
 
     // second pass, symbolize
     for (path, addr_to_symbol_mapping) in addresses_per_sample.iter_mut() {
-        let frame_addresses = addr_to_symbol_mapping.iter().map(|(a, _)| *a).collect();
+        let frame_addresses = addr_to_symbol_mapping.keys().copied().collect();
         let symbolized_frames = symbolize_native_stack_blaze(frame_addresses, path);
         for ((frame_address, _), symbolized_frame) in addr_to_symbol_mapping
             .clone()
@@ -390,7 +398,12 @@ fn symbolize_kernel_stack(kernel_stack: &[Frame], ksyms: &[Ksym]) -> Vec<Frame> 
         symbolized_stack.push(Frame {
             virtual_address: frame.virtual_address,
             file_offset: None,
-            symbolization_result: Some(Ok((symbol.symbol_name.to_string(), false))),
+            symbolization_result: Some(Ok(SymbolizedFrame::new(
+                symbol.symbol_name.to_string(),
+                false,
+                None,
+                None,
+            ))),
         });
     }
     symbolized_stack
@@ -414,7 +427,7 @@ fn symbolize_user_stack(
             continue;
         };
 
-        let Some(mapping) = info.mappings.for_address(frame.virtual_address) else {
+        let Some(mapping) = info.mappings.for_address(&frame.virtual_address) else {
             result.push(Frame::with_error(
                 frame.virtual_address,
                 "<could not find mapping>".to_string(),

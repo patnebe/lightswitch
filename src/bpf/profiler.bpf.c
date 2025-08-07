@@ -32,31 +32,14 @@ struct {
 } heap SEC(".maps");
 
 
-// Maps to store unwind information. There are 'outer' maps for every
-// bucket size. The bucket sizes are defined in userspace and they'll
-// determine how many unwind entries fit in the 'inner' BPF array maps
+// Holds BPF array maps which store unwind information.
 
-#define NEW_OUTER_MAP(__map_id)                         \
-  struct {                                              \
-    __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);            \
-    __uint(max_entries, MAX_OUTER_UNWIND_MAP_ENTRIES);  \
-    __type(key, u64);                                   \
-    __type(value, u32);                                 \
-  } outer_map_##__map_id SEC(".maps");
-
-NEW_OUTER_MAP(0);
-NEW_OUTER_MAP(1);
-NEW_OUTER_MAP(2);
-NEW_OUTER_MAP(3);
-NEW_OUTER_MAP(4);
-NEW_OUTER_MAP(5);
-NEW_OUTER_MAP(6);
-NEW_OUTER_MAP(7);
-NEW_OUTER_MAP(8);
-NEW_OUTER_MAP(9);
-NEW_OUTER_MAP(10);
-NEW_OUTER_MAP(11);
-NEW_OUTER_MAP(12);
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, MAX_OUTER_UNWIND_MAP_ENTRIES);
+  __type(key, u64);
+  __type(value, u32);
+} outer_map SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
@@ -129,40 +112,6 @@ static __always_inline u64 find_offset_for_pc(void *inner_map, u16 pc_low, u64 l
   return BINARY_SEARCH_EXHAUSTED_ITERATIONS;
 }
 
-void* find_map_for_bucket(u32 bucket_id) {
-  void *outer_map = NULL;
-
-  if (bucket_id == 0) {
-    outer_map = &outer_map_0;
-  } else if (bucket_id == 1) {
-    outer_map = &outer_map_1;
-  } else if (bucket_id == 2) {
-    outer_map = &outer_map_2;
-  } else if (bucket_id == 3) {
-    outer_map = &outer_map_3;
-  } else if (bucket_id == 4) {
-    outer_map = &outer_map_4;
-  } else if (bucket_id == 5) {
-    outer_map = &outer_map_5;
-  } else if (bucket_id == 6) {
-    outer_map = &outer_map_6;
-  } else if (bucket_id == 7) {
-    outer_map = &outer_map_7;
-  } else if (bucket_id == 8) {
-    outer_map = &outer_map_8;
-  } else if (bucket_id == 9) {
-    outer_map = &outer_map_9;
-  } else if (bucket_id == 10) {
-    outer_map = &outer_map_10;
-  } else if (bucket_id == 11) {
-    outer_map = &outer_map_11;
-  } else if (bucket_id == 12) {
-    outer_map = &outer_map_12;
-  }
-
-  return outer_map;
-}
-
 // Finds the shard information for a given pid and program counter. Optionally,
 // and offset can be passed that will be filled in with the mapping's load
 // address.
@@ -176,12 +125,7 @@ find_page(mapping_t *mapping, u64 object_relative_pc, u64 *low_index, u64 *high_
   page_value_t *found_page = bpf_map_lookup_elem(&executable_to_page, &page_key);
 
   if (found_page != NULL) {
-    void *outer_map = find_map_for_bucket(found_page->bucket_id);
-    if (outer_map == NULL) {
-      return NULL;
-    }
-
-    void *inner_map = bpf_map_lookup_elem(outer_map, &mapping->executable_id);
+    void *inner_map = bpf_map_lookup_elem(&outer_map, &mapping->executable_id);
     if (inner_map != NULL) {
       *low_index = found_page->low_index;
       *high_index = found_page->high_index;
@@ -315,25 +259,42 @@ static __always_inline bool retrieve_task_registers(u64 *ip, u64 *sp, u64 *bp, u
 }
 
 static __always_inline void add_stack(struct bpf_perf_event_data *ctx,
-u64 pid_tgid,
 unwind_state_t *unwind_state) {
-  // Get the kernel stack
-  int ret = bpf_get_stack(ctx, unwind_state->stack.kernel_stack.addresses, MAX_STACK_DEPTH * sizeof(u64), 0);
-  if (ret >= 0) {
-    unwind_state->stack.kernel_stack.len = ret / sizeof(u64);
+  // Unwind and copy kernel stack.
+  u32 ulen = unwind_state->sample.stack.ulen;
+  if (ulen < MAX_STACK_DEPTH) {
+    int ret = bpf_get_stack(ctx, &unwind_state->sample.stack.addresses[ulen], MAX_STACK_DEPTH * sizeof(u64), 0);
+    if (ret > 0) {
+      unwind_state->sample.stack.klen = ret / sizeof(u64);
+    }
   }
 
-  int per_process_id = pid_tgid >> 32;
-  int per_thread_id = pid_tgid;
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+  unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+  int per_process_id = BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
+  int per_thread_id = BPF_CORE_READ(task, thread_pid, numbers[level].nr);
 
-  unwind_state->stack.stack_key.pid = per_process_id;
-  unwind_state->stack.stack_key.task_id = per_thread_id;
-  unwind_state->stack.stack_key.collected_at = bpf_ktime_get_boot_ns();
 
+  unwind_state->sample.pid = per_process_id;
+  unwind_state->sample.tid = per_thread_id;
+  unwind_state->sample.collected_at = bpf_ktime_get_boot_ns();
+
+  u32 sample_size = sizeof(sample_t)
+    // Remove the actual stack buffer which was doubled to appease the verifier.
+    - 2 * MAX_STACK_DEPTH * sizeof(u64)
+    // Add the actual stack size in bytes.
+    + (unwind_state->sample.stack.ulen + unwind_state->sample.stack.klen) * sizeof(u64);
+
+  // Appease the verifier.
+  if (sample_size > sizeof(sample_t)) {
+    return;
+  }
+
+  int ret = 0;
   if (lightswitch_config.use_ring_buffers) {
-    ret = bpf_ringbuf_output(&stacks_rb, &(unwind_state->stack), sizeof(stack_sample_t), 0);
+    ret = bpf_ringbuf_output(&stacks_rb, &(unwind_state->sample), sample_size, 0);
   } else {
-    ret = bpf_perf_event_output(ctx, &stacks, BPF_F_CURRENT_CPU, &(unwind_state->stack), sizeof(stack_sample_t));
+    ret = bpf_perf_event_output(ctx, &stacks, BPF_F_CURRENT_CPU, &(unwind_state->sample), sample_size);
   }
 
   if (ret < 0) {
@@ -349,9 +310,10 @@ unwind_state_t *unwind_state) {
 // The unwinding machinery lives here.
 SEC("perf_event")
 int dwarf_unwind(struct bpf_perf_event_data *ctx) {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  int per_process_id = pid_tgid >> 32;
-  int per_thread_id = pid_tgid;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+	int per_process_id = BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
+  int per_thread_id = BPF_CORE_READ(task, thread_pid, numbers[level].nr);
 
   bool reached_bottom_of_stack = false;
   u64 zero = 0;
@@ -364,7 +326,7 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
 
   for (int i = 0; i < MAX_STACK_DEPTH_PER_PROGRAM; i++) {
     // LOG("[debug] Within unwinding machinery loop");
-    LOG("## frame: %d", unwind_state->stack.stack.len);
+    LOG("## frame: %d", unwind_state->sample.stack.ulen);
     LOG("\tcurrent pc: %llx", unwind_state->ip);
     LOG("\tcurrent sp: %llx", unwind_state->sp);
     LOG("\tcurrent bp: %llx", unwind_state->bp);
@@ -481,11 +443,11 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
     }
 
     // Add address to stack.
-    u64 len = unwind_state->stack.stack.len;
+    u32 ulen = unwind_state->sample.stack.ulen;
     // Appease the verifier.
-    if (len >= 0 && len < MAX_STACK_DEPTH) {
-      unwind_state->stack.stack.addresses[len] = unwind_state->ip;
-      unwind_state->stack.stack.len++;
+    if (ulen < MAX_STACK_DEPTH) {
+      unwind_state->sample.stack.addresses[ulen] = unwind_state->ip;
+      unwind_state->sample.stack.ulen++;
     }
 
     if (found_rbp_type == RBP_TYPE_REGISTER ||
@@ -501,20 +463,23 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
       previous_rsp = unwind_state->bp + found_cfa_offset;
     } else if (found_cfa_type == CFA_TYPE_RSP) {
       previous_rsp = unwind_state->sp + found_cfa_offset;
-    } else if (found_cfa_type == CFA_TYPE_EXPRESSION) {
-      if (found_cfa_offset == DWARF_EXPRESSION_UNKNOWN) {
-        LOG("[unsup] CFA is an unsupported expression, bailing out");
+    } else if (found_cfa_type == CFA_TYPE_DEREF_AND_ADD) {
+      u8 offset = found_cfa_offset >> 8;
+      u8 addition = found_cfa_offset;
+      LOG("dwarf exp: *($rsp + %d) + %d", offset, addition);
+      int ret =
+          bpf_probe_read_user(&previous_rsp, 8, (void *)(unwind_state->sp + offset));
+      if (ret < 0) {
+        LOG("[error] reading previous rsp failed with %d", ret);
+        bump_unwind_error_previous_rsp_read();
+      }
+      previous_rsp += addition;
+    } else if (found_cfa_type == CFA_TYPE_CFA_TYPE_UNSUP_EXP) {
         bump_unwind_error_unsupported_expression();
         return 1;
-      }
-
+    } else if (found_cfa_type == CFA_TYPE_PLT1 || found_cfa_type == CFA_TYPE_PLT2) {
       LOG("CFA expression found with id %d", found_cfa_offset);
-      u64 threshold = 0;
-      if (found_cfa_offset == DWARF_EXPRESSION_PLT1) {
-        threshold = 11;
-      } else if (found_cfa_offset == DWARF_EXPRESSION_PLT2) {
-        threshold = 10;
-      }
+      u64 threshold = 11 ? found_cfa_type == CFA_TYPE_PLT1 : 10;
 
       if (threshold == 0) {
         bump_unwind_error_should_never_happen();
@@ -523,8 +488,7 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
       previous_rsp = unwind_state->sp + 8 +
                      ((((unwind_state->ip & 15) >= threshold)) << 3);
     } else {
-      LOG("\t[unsup] register %d not valid (expected $rbp or $rsp)",
-          found_cfa_type);
+      LOG("\t[unsup] cfa type %d not valid at ip: %llx", found_cfa_type, object_relative_pc);
       bump_unwind_error_unsupported_cfa_register();
       return 1;
     }
@@ -549,11 +513,9 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
           previous_rbp_addr);
       int ret =
           bpf_probe_read_user(&previous_rbp, 8, (void *)(previous_rbp_addr));
-      if (ret != 0) {
-        LOG("[error] previous_rbp should not be zero. This can mean "
-            "that the read has failed %d.",
-            ret);
-        bump_unwind_error_previous_rbp_zero();
+      if (ret < 0) {
+        LOG("[error] previous_rbp read failed with %d", ret);
+        bump_unwind_error_previous_rbp_read();
         return 1;
       }
     }
@@ -569,7 +531,7 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
 
 #ifdef __TARGET_ARCH_arm64
     // Special handling for leaf frame.
-    if (unwind_state->stack.stack.len == 0) {
+    if (unwind_state->sample.stack.ulen == 0) {
       previous_rip = unwind_state->lr;
     } else {
       // This is guaranteed by the Aarch64 ABI.
@@ -585,7 +547,7 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
         LOG("[warn] previous_rip=0, maybe this is a JIT segment?");
       } else {
         LOG("[error] previous_rip should not be zero. This can mean that the "
-            "read failed, ret=%d while reading @ %llx.",
+           "read failed, ret=%d while reading @ %llx.",
             err, previous_rip_addr);
         bump_unwind_error_previous_rip_zero();
       }
@@ -621,16 +583,16 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
 
     bool main_thread = per_process_id == per_thread_id;
     if (main_thread && unwind_state->bp != 0) {
-      LOG("[error] Expected rbp to be 0 but found %llx, pc: %llx (Node.js is not well supported yet)", unwind_state->bp, unwind_state->ip);
+      LOG("[error] Expected rbp to be 0 on main thread but found %llx, pc: %llx", unwind_state->bp, unwind_state->ip);
       bump_unwind_bp_non_zero_for_bottom_frame();
     }
 
     LOG("======= reached bottom frame! =======");
-    add_stack(ctx, pid_tgid, unwind_state);
+    add_stack(ctx, unwind_state);
     bump_unwind_success_dwarf();
     return 0;
 
-  } else if (unwind_state->stack.stack.len < MAX_STACK_DEPTH &&
+  } else if (unwind_state->sample.stack.ulen < MAX_STACK_DEPTH &&
              unwind_state->tail_calls < MAX_TAIL_CALLS) {
     LOG("Continuing walking the stack in a tail call, current tail %d",
         unwind_state->tail_calls);
@@ -646,13 +608,13 @@ int dwarf_unwind(struct bpf_perf_event_data *ctx) {
 
 // Set up the initial unwinding state.
 static __always_inline bool set_initial_state(unwind_state_t *unwind_state, bpf_user_pt_regs_t *regs) {
- unwind_state->stack.stack.len = 0;
- unwind_state->stack.kernel_stack.len = 0;
+ unwind_state->sample.stack.ulen = 0;
+ unwind_state->sample.stack.klen = 0;
  unwind_state->tail_calls = 0;
 
- unwind_state->stack.stack_key.pid = 0;
- unwind_state->stack.stack_key.task_id = 0;
- unwind_state->stack.stack_key.collected_at = 0;
+ unwind_state->sample.pid = 0;
+ unwind_state->sample.tid = 0;
+ unwind_state->sample.collected_at = 0;
 
   if (in_kernel(PT_REGS_IP(regs))) {
     if (!retrieve_task_registers(&unwind_state->ip, &unwind_state->sp, &unwind_state->bp, &unwind_state->lr)) {
@@ -673,8 +635,9 @@ static __always_inline bool set_initial_state(unwind_state_t *unwind_state, bpf_
 
 SEC("perf_event")
 int on_event(struct bpf_perf_event_data *ctx) {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  int per_process_id = pid_tgid >> 32;
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+	unsigned int level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+	int per_process_id = BPF_CORE_READ(task, group_leader, thread_pid, numbers[level].nr);
 
   // There's no point in checking for the swapper process.
   if (per_process_id == 0) {

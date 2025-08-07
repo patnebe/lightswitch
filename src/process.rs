@@ -49,7 +49,6 @@ pub struct ExecutableMapping {
     // kaslr info etc etc
     pub offset: u64,
     pub load_address: u64,
-    pub main_exec: bool,
     pub soft_delete: bool,
 }
 
@@ -58,14 +57,10 @@ pub struct ExecutableMappings(pub Vec<ExecutableMapping>);
 
 impl ExecutableMappings {
     /// Find the executable mapping a given virtual address falls into.
-    pub fn for_address(&self, virtual_address: u64) -> Option<ExecutableMapping> {
-        for mapping in &self.0 {
-            if (mapping.start_addr..mapping.end_addr).contains(&virtual_address) {
-                return Some(mapping.clone());
-            }
-        }
-
-        None
+    pub fn for_address(&self, virtual_address: &u64) -> Option<&ExecutableMapping> {
+        self.0
+            .iter()
+            .find(|&mapping| (mapping.start_addr..mapping.end_addr).contains(virtual_address))
     }
 }
 
@@ -185,7 +180,6 @@ mod tests {
             end_addr: 0x100 + 100,
             offset: 0x0,
             load_address: 0x0,
-            main_exec: false,
             soft_delete: false,
         };
 

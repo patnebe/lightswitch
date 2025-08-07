@@ -29,7 +29,7 @@ fn build_test_binary(target: &str) {
     let output = Command::new(nix_bin())
         .args([
             "build",
-            &format!("./tests/testprogs#{}", target),
+            &format!("./tests/testprogs#{target}"),
             "--out-link",
             "target/nix",
         ])
@@ -51,7 +51,7 @@ struct TestProcess {
 impl TestProcess {
     fn new(target: &str) -> Self {
         Self {
-            child: Command::new(format!("./target/nix/bin/{}", target))
+            child: Command::new(format!("./target/nix/bin/{target}"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -78,7 +78,7 @@ fn assert_any_stack_contains(
         let stack_string = sample
             .ustack
             .iter()
-            .map(|e| e.symbolization_result.clone().unwrap().unwrap().0)
+            .map(|e| e.symbolization_result.clone().unwrap().unwrap().name)
             .collect::<Vec<_>>()
             .join("::");
 

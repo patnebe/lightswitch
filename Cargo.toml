@@ -1,6 +1,6 @@
 [package]
 name = "lightswitch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "CPU profiler as a library for Linux suitable for on-demand and continuous profiling"
 license = "MIT"
@@ -35,7 +35,6 @@ libbpf-sys = "1.5.0"
 gimli = "0.31.1"
 lazy_static = "1.5.0"
 plain = "0.2.3"
-page_size = "0.6.0"
 clap = { version = "4.5.32", features = ["derive", "string"] }
 # See https://github.com/libbpf/blazesym/issues/1105.
 blazesym = { git = "https://github.com/libbpf/blazesym", rev = "94821e3", features = ["zlib"] }
@@ -48,9 +47,9 @@ ctrlc = "3.4.5"
 crossbeam-channel = "0.5.14"
 itertools = "0.14.0"
 lightswitch-metadata = { path = "lightswitch-metadata", version = "0.2.1" }
-lightswitch-proto = { path = "lightswitch-proto", version = "0.2.0" }
-lightswitch-capabilities = { path = "lightswitch-capabilities", version = "0.2.0" }
-lightswitch-object = { path = "lightswitch-object", version = "0.3.0" }
+lightswitch-proto = { path = "lightswitch-proto", version = "0.2.1" }
+lightswitch-capabilities = { path = "lightswitch-capabilities", version = "0.2.1" }
+lightswitch-object = { path = "lightswitch-object", version = "0.3.1" }
 memmap2 = { workspace = true }
 anyhow = { workspace = true }
 libbpf-sys = { workspace = true }

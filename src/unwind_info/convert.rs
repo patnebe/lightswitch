@@ -1,7 +1,11 @@
 use std::fs::File;
 
 use anyhow::Result;
-use gimli::{CfaRule, CieOrFde, EhFrame, UnwindContext, UnwindSection};
+use gimli::{
+    CfaRule, CieOrFde, EhFrame, Encoding, Format,
+    Operation::{Deref, PlusConstant, RegisterOffset},
+    UnwindContext, UnwindSection,
+};
 use memmap2::Mmap;
 use object::Architecture;
 use object::{Object, ObjectSection};
@@ -35,11 +39,13 @@ pub enum UnwindData {
 pub struct CompactUnwindInfoBuilder<'a> {
     mmap: Mmap,
     callback: Box<dyn FnMut(&UnwindData) + 'a>,
+    first_frame_override: Option<(u64, u64)>,
 }
 
 impl<'a> CompactUnwindInfoBuilder<'a> {
     pub fn with_callback(
         path: &'a str,
+        first_frame_override: Option<(u64, u64)>,
         callback: impl FnMut(&UnwindData) + 'a,
     ) -> anyhow::Result<Self> {
         let in_file = File::open(path)?;
@@ -48,6 +54,7 @@ impl<'a> CompactUnwindInfoBuilder<'a> {
         Ok(Self {
             mmap,
             callback: Box::new(callback),
+            first_frame_override,
         })
     }
 
@@ -170,18 +177,42 @@ impl<'a> CompactUnwindInfoBuilder<'a> {
                                 }
                             }
                             CfaRule::Expression(exp) => {
+                                compact_row.cfa_type = CfaType::UnsupportedExpression;
+
                                 if let Ok(expression) = exp.get(&eh_frame) {
                                     let expression_data = expression.0.slice();
                                     if expression_data == *PLT1 {
-                                        compact_row.cfa_offset = PltType::Plt1 as u16;
+                                        compact_row.cfa_type = CfaType::Plt1;
                                     } else if expression_data == *PLT2 {
-                                        compact_row.cfa_offset = PltType::Plt2 as u16;
-                                    }
-                                } else {
-                                    compact_row.cfa_offset = PltType::Unknown as u16;
-                                }
+                                        compact_row.cfa_type = CfaType::Plt2;
+                                    } else {
+                                        let mut ops = expression.operations(Encoding {
+                                            format: Format::Dwarf64,
+                                            version: 4,
+                                            address_size: 8,
+                                        });
 
-                                compact_row.cfa_type = CfaType::Expression;
+                                        match (ops.next(), ops.next(), ops.next(), ops.next()) {
+                                            (
+                                                Ok(Some(RegisterOffset {
+                                                    register, offset, ..
+                                                })),
+                                                Ok(Some(Deref { .. })),
+                                                Ok(Some(PlusConstant { value: addition })),
+                                                Ok(None),
+                                            ) if register == stack_pointer => {
+                                                debug!("*(rsp+{offset})+{addition}");
+                                                compact_row.cfa_type = CfaType::DerefAndAdd;
+                                                // Assumes that both the offset and addition will fit in 2 bytes,
+                                                // which seems to be the case for many binaries I've tried but
+                                                // would be good to test against larger ones.
+                                                compact_row.cfa_offset =
+                                                    ((offset as u16) << 8) | (addition as u16);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
                         };
 
@@ -219,6 +250,12 @@ impl<'a> CompactUnwindInfoBuilder<'a> {
                     _ => continue,
                 }
 
+                if let Some(first_frame_override) = self.first_frame_override {
+                    if compact_row.pc == first_frame_override.0 {
+                        compact_row = CompactUnwindRow::stop_unwinding(compact_row.pc);
+                    }
+                }
+
                 (self.callback)(&UnwindData::Instruction(compact_row));
             }
         }
@@ -226,47 +263,43 @@ impl<'a> CompactUnwindInfoBuilder<'a> {
     }
 }
 
-pub fn compact_unwind_info(path: &str) -> anyhow::Result<Vec<CompactUnwindRow>> {
+pub fn compact_unwind_info(
+    path: &str,
+    first_frame_override: Option<(u64, u64)>,
+) -> anyhow::Result<Vec<CompactUnwindRow>> {
     let mut unwind_info: Vec<CompactUnwindRow> = Vec::new();
     let mut last_function_end_addr: Option<u64> = None;
     let mut last_row = None;
 
-    let builder = CompactUnwindInfoBuilder::with_callback(path, |unwind_data| {
-        match unwind_data {
-            UnwindData::Function(_, end_addr) => {
-                // Add the end addr when we hit a new func
-                match last_function_end_addr {
-                    Some(addr) => {
-                        let marker = CompactUnwindRow::stop_unwinding(addr);
-
-                        let row = CompactUnwindRow {
-                            pc: marker.pc,
-                            cfa_offset: marker.cfa_offset,
-                            cfa_type: marker.cfa_type,
-                            rbp_type: marker.rbp_type,
-                            rbp_offset: marker.rbp_offset,
-                        };
-                        unwind_info.push(row)
+    let builder =
+        CompactUnwindInfoBuilder::with_callback(path, first_frame_override, |unwind_data| {
+            match unwind_data {
+                UnwindData::Function(_start_addr, end_addr) => {
+                    // Add the end addr when we hit a new func
+                    match last_function_end_addr {
+                        Some(addr) => {
+                            let row = CompactUnwindRow::stop_unwinding(addr);
+                            unwind_info.push(row)
+                        }
+                        None => {
+                            // todo: cleanup
+                        }
                     }
-                    None => {
-                        // todo: cleanup
-                    }
+                    last_function_end_addr = Some(*end_addr);
                 }
-                last_function_end_addr = Some(*end_addr);
+                UnwindData::Instruction(compact_row) => {
+                    let row = CompactUnwindRow {
+                        pc: compact_row.pc,
+                        cfa_offset: compact_row.cfa_offset,
+                        cfa_type: compact_row.cfa_type,
+                        rbp_type: compact_row.rbp_type,
+                        rbp_offset: compact_row.rbp_offset,
+                    };
+                    unwind_info.push(row);
+                    last_row = Some(*compact_row)
+                }
             }
-            UnwindData::Instruction(compact_row) => {
-                let row = CompactUnwindRow {
-                    pc: compact_row.pc,
-                    cfa_offset: compact_row.cfa_offset,
-                    cfa_type: compact_row.cfa_type,
-                    rbp_type: compact_row.rbp_type,
-                    rbp_offset: compact_row.rbp_offset,
-                };
-                unwind_info.push(row);
-                last_row = Some(*compact_row)
-            }
-        }
-    });
+        });
 
     builder?.process()?;
 

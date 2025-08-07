@@ -15,23 +15,71 @@ pub struct Frame {
     pub file_offset: Option<u64>,
     /// If symbolized, the result will be present here with the function name and whether the function
     /// was inlined.
-    pub symbolization_result: Option<Result<(String, bool), SymbolizationError>>,
+    pub symbolization_result: Option<Result<SymbolizedFrame, SymbolizationError>>,
+}
+
+/// A symbolized frame, which might or might not the filename or line number, depending on the
+/// symbolization data source.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Default)]
+pub struct SymbolizedFrame {
+    pub name: String,
+    pub inlined: bool,
+    pub filename: Option<String>,
+    pub line: Option<u32>,
+}
+
+impl SymbolizedFrame {
+    pub fn new(name: String, inlined: bool, filename: Option<String>, line: Option<u32>) -> Self {
+        SymbolizedFrame {
+            name,
+            inlined,
+            filename,
+            line,
+        }
+    }
+}
+
+impl Frame {
+    /// Returns the formatted frame showing only the function names if [`only_show_function_name`]
+    /// is true otherwise it will show the file and line number if available.
+    pub fn format_all_info(&self, only_show_function_name: bool) -> String {
+        match &self.symbolization_result {
+            Some(Ok(SymbolizedFrame {
+                name,
+                inlined,
+                filename,
+                line,
+            })) => {
+                let mut res = String::new();
+
+                let inline_str = if *inlined { "[inlined] " } else { "" };
+                res.push_str(&format!("{inline_str}{name}"));
+
+                if !only_show_function_name {
+                    res.push(' ');
+                    let filename = filename.clone().unwrap_or("<no file>".to_string());
+                    let line = if let Some(num) = line {
+                        num.to_string()
+                    } else {
+                        "<no line>".to_string()
+                    };
+                    res.push_str(&format!("({filename}:{line})"))
+                }
+
+                res
+            }
+            Some(Err(e)) => {
+                format!("error: {e:?}")
+            }
+            None => "frame not symbolized".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Frame {
+    /// Only writes the function name.
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        match &self.symbolization_result {
-            Some(Ok((name, inlined))) => {
-                let inline_str = if *inlined { "[inlined] " } else { "" };
-                write!(fmt, "{}{}", inline_str, name)
-            }
-            Some(Err(e)) => {
-                write!(fmt, "error: {:?}", e)
-            }
-            None => {
-                write!(fmt, "frame not symbolized")
-            }
-        }
+        write!(fmt, "{}", self.format_all_info(true))
     }
 }
 

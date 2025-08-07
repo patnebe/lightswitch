@@ -3,19 +3,19 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use memmap2::Mmap;
 use ring::digest::{Context, Digest, SHA256};
 
-use object::elf::{FileHeader32, FileHeader64, PT_LOAD};
-use object::read::elf::FileHeader;
-use object::read::elf::ProgramHeader;
 use object::Endianness;
 use object::FileKind;
 use object::Object;
 use object::ObjectKind;
 use object::ObjectSection;
 use object::ObjectSymbol;
+use object::elf::{FileHeader32, FileHeader64, PF_X, PT_LOAD};
+use object::read::elf::FileHeader;
+use object::read::elf::ProgramHeader;
 
 use crate::{BuildId, ExecutableId};
 
@@ -30,10 +30,21 @@ pub struct ElfLoad {
 
 #[derive(Clone)]
 pub enum Runtime {
-    /// C, C++, Rust, Fortran.
+    /// C, C++, Rust, Fortran
     CLike,
-    /// Golang.
+    /// Zig. Needs special handling because before [0] the top level frame (`start`) didn't have the
+    /// right unwind information
+    ///
+    /// [0]: https://github.com/ziglang/zig/commit/130f7c2ed8e3358e24bb2fc7cca57f7a6f1f85c3
+    Zig {
+        start_low_address: u64,
+        start_high_address: u64,
+    },
+    /// Golang
     Go(Vec<StopUnwindingFrames>),
+    /// V8, used by Node.js which is always compiled with frame pointers and has handwritten
+    /// code sections that aren't covered by the unwind information
+    V8,
 }
 
 #[derive(Debug, Clone)]
@@ -98,10 +109,10 @@ impl ObjectFile {
 
         // Golang (the Go toolchain does not interpret these bytes as we do).
         for section in object.sections() {
-            if section.name()? == ".note.go.buildid" {
-                if let Ok(data) = section.data() {
-                    return Ok(BuildId::go_from_bytes(data)?);
-                }
+            if section.name()? == ".note.go.buildid"
+                && let Ok(data) = section.data()
+            {
+                return Ok(BuildId::go_from_bytes(data)?);
             }
         }
 
@@ -125,19 +136,44 @@ impl ObjectFile {
         if self.is_go() {
             Runtime::Go(self.go_stop_unwinding_frames())
         } else {
+            let mut is_zig = false;
+            let mut zig_first_frame = None;
+
+            for symbol in self.object.symbols() {
+                let Ok(name) = symbol.name() else { continue };
+                if name.starts_with("_ZZN2v88internal") {
+                    return Runtime::V8;
+                }
+                if name.starts_with("__zig") {
+                    is_zig = true;
+                }
+                if name == "_start" {
+                    zig_first_frame = Some((symbol.address(), symbol.address() + symbol.size()));
+                }
+
+                // Once we've found both Zig markers we are done. Not that this is a heuristic and it's
+                // possible that a Zig library is linked against code written in a C-like language. In this
+                // case we might be rewriting unwind information that's correct. This won't have a negative
+                // effect as `_start` is always the first function.
+                if is_zig && let Some((low_address, high_address)) = zig_first_frame {
+                    return Runtime::Zig {
+                        start_low_address: low_address,
+                        start_high_address: high_address,
+                    };
+                }
+            }
             Runtime::CLike
         }
     }
 
     pub fn is_go(&self) -> bool {
         for section in self.object.sections() {
-            if let Ok(section_name) = section.name() {
-                if section_name == ".gosymtab"
+            if let Ok(section_name) = section.name()
+                && (section_name == ".gosymtab"
                     || section_name == ".gopclntab"
-                    || section_name == ".note.go.buildid"
-                {
-                    return true;
-                }
+                    || section_name == ".note.go.buildid")
+            {
+                return true;
             }
         }
         false
@@ -168,6 +204,9 @@ impl ObjectFile {
         r
     }
 
+    /// Retrieves the executable load segments. These are used to convert
+    /// virtual addresses to offsets in an executable during unwinding
+    /// and symbolization.
     pub fn elf_load_segments(&self) -> Result<Vec<ElfLoad>> {
         let mmap = &**self.mmap;
 
@@ -179,13 +218,14 @@ impl ObjectFile {
 
                 let mut elf_loads = Vec::new();
                 for segment in segments {
-                    if segment.p_type(endian) == PT_LOAD {
-                        elf_loads.push(ElfLoad {
-                            p_offset: segment.p_offset(endian) as u64,
-                            p_vaddr: segment.p_vaddr(endian) as u64,
-                            p_filesz: segment.p_filesz(endian) as u64,
-                        });
+                    if segment.p_type(endian) != PT_LOAD || segment.p_flags(endian) & PF_X == 0 {
+                        continue;
                     }
+                    elf_loads.push(ElfLoad {
+                        p_offset: segment.p_offset(endian) as u64,
+                        p_vaddr: segment.p_vaddr(endian) as u64,
+                        p_filesz: segment.p_filesz(endian) as u64,
+                    });
                 }
                 Ok(elf_loads)
             }
@@ -196,13 +236,14 @@ impl ObjectFile {
 
                 let mut elf_loads = Vec::new();
                 for segment in segments {
-                    if segment.p_type(endian) == PT_LOAD {
-                        elf_loads.push(ElfLoad {
-                            p_offset: segment.p_offset(endian),
-                            p_vaddr: segment.p_vaddr(endian),
-                            p_filesz: segment.p_filesz(endian),
-                        });
+                    if segment.p_type(endian) != PT_LOAD || segment.p_flags(endian) & PF_X == 0 {
+                        continue;
                     }
+                    elf_loads.push(ElfLoad {
+                        p_offset: segment.p_offset(endian),
+                        p_vaddr: segment.p_vaddr(endian),
+                        p_filesz: segment.p_filesz(endian),
+                    });
                 }
                 Ok(elf_loads)
             }
@@ -221,10 +262,10 @@ pub fn code_hash(object: &object::File) -> Option<Digest> {
             continue;
         };
 
-        if section_name == ".text" {
-            if let Ok(section) = section.data() {
-                return Some(sha256_digest(section));
-            }
+        if section_name == ".text"
+            && let Ok(section) = section.data()
+        {
+            return Some(sha256_digest(section));
         }
     }
 

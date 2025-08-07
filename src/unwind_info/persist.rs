@@ -15,7 +15,7 @@ use crate::unwind_info::types::CompactUnwindRow;
 // To identify this binary file type.
 const MAGIC_NUMBER: u32 = 0x1357531;
 // Any changes to the ABI / digest must bump the version.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 type UnwindInformationDigest = u64;
 
@@ -51,12 +51,14 @@ unsafe impl Plain for CompactUnwindRow {}
 /// Writes compact information to a given writer.
 pub struct Writer {
     executable_path: PathBuf,
+    first_frame_override: Option<(u64, u64)>,
 }
 
 impl Writer {
-    pub fn new(executable_path: &Path) -> Self {
+    pub fn new(executable_path: &Path, first_frame_override: Option<(u64, u64)>) -> Self {
         Writer {
             executable_path: executable_path.to_path_buf(),
+            first_frame_override,
         }
     }
 
@@ -64,7 +66,7 @@ impl Writer {
         self,
         writer: &mut W,
     ) -> Result<Vec<CompactUnwindRow>, WriterError> {
-        let unwind_info = self.read_unwind_info()?;
+        let unwind_info = self.read_unwind_info(self.first_frame_override)?;
         // Write dummy header.
         self.write_header(writer, 0, None)?;
         let digest = self.write_unwind_info(writer, &unwind_info)?;
@@ -74,9 +76,15 @@ impl Writer {
         Ok(unwind_info)
     }
 
-    fn read_unwind_info(&self) -> Result<Vec<CompactUnwindRow>, WriterError> {
-        compact_unwind_info(&self.executable_path.to_string_lossy())
-            .map_err(|e| WriterError::UnwindInfoGeneric(e.to_string()))
+    fn read_unwind_info(
+        &self,
+        first_frame_override: Option<(u64, u64)>,
+    ) -> Result<Vec<CompactUnwindRow>, WriterError> {
+        compact_unwind_info(
+            &self.executable_path.to_string_lossy(),
+            first_frame_override,
+        )
+        .map_err(|e| WriterError::UnwindInfoGeneric(e.to_string()))
     }
 
     fn write_header(
@@ -137,12 +145,17 @@ pub enum ReaderError {
 pub struct Reader<'a> {
     header: Header,
     data: &'a [u8],
+    check_digest: bool,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(data: &'a [u8]) -> Result<Self, ReaderError> {
+    pub fn new(data: &'a [u8], check_digest: bool) -> Result<Self, ReaderError> {
         let header = Self::parse_header(data)?;
-        Ok(Reader { header, data })
+        Ok(Reader {
+            header,
+            data,
+            check_digest,
+        })
     }
 
     fn parse_header(data: &[u8]) -> Result<Header, ReaderError> {
@@ -150,7 +163,7 @@ impl<'a> Reader<'a> {
         let mut header = Header::default();
         let header_data = data.get(0..header_size).ok_or(ReaderError::OutOfRange)?;
         plain::copy_from_bytes(&mut header, header_data)
-            .map_err(|e| ReaderError::Generic(format!("{:?}", e)))?;
+            .map_err(|e| ReaderError::Generic(format!("{e:?}")))?;
 
         if header.magic != MAGIC_NUMBER {
             return Err(ReaderError::MagicNumber);
@@ -182,22 +195,26 @@ impl<'a> Reader<'a> {
             let unwind_row_data = unwind_info_data
                 .get(step..step + unwind_row_size)
                 .ok_or(ReaderError::OutOfRange)?;
-            context.update(unwind_row_data);
+            if self.check_digest {
+                context.update(unwind_row_data);
+            }
             plain::copy_from_bytes(&mut unwind_row, unwind_row_data)
-                .map_err(|e| ReaderError::Generic(format!("{:?}", e)))?;
+                .map_err(|e| ReaderError::Generic(format!("{e:?}")))?;
             unwind_info.push(unwind_row);
         }
 
-        let mut buffer = [0; 8];
-        let _ = context
-            .finish()
-            .as_ref()
-            .read(&mut buffer)
-            .map_err(|e| ReaderError::Generic(e.to_string()));
-        let digest = u64::from_ne_bytes(buffer);
+        if self.check_digest {
+            let mut buffer = [0; 8];
+            let _ = context
+                .finish()
+                .as_ref()
+                .read(&mut buffer)
+                .map_err(|e| ReaderError::Generic(e.to_string()));
+            let digest = u64::from_ne_bytes(buffer);
 
-        if self.header.unwind_info_digest != digest {
-            return Err(ReaderError::Digest);
+            if self.header.unwind_info_digest != digest {
+                return Err(ReaderError::Digest);
+            }
         }
 
         Ok(unwind_info)
@@ -215,14 +232,17 @@ mod tests {
     fn test_write_and_read_unwind_info() {
         let mut buffer = Cursor::new(Vec::new());
         let path = PathBuf::from("/proc/self/exe");
-        let writer = Writer::new(&path);
+        let writer = Writer::new(&path, None);
         assert!(writer.write(&mut buffer).is_ok());
 
-        let reader = Reader::new(&buffer.get_ref()[..]);
+        let reader = Reader::new(&buffer.get_ref()[..], true);
         let unwind_info = reader.unwrap().unwind_info();
         assert!(unwind_info.is_ok());
         let unwind_info = unwind_info.unwrap();
-        assert_eq!(unwind_info, compact_unwind_info("/proc/self/exe").unwrap());
+        assert_eq!(
+            unwind_info,
+            compact_unwind_info("/proc/self/exe", None).unwrap()
+        );
     }
 
     #[test]
@@ -236,7 +256,7 @@ mod tests {
             .write_all(unsafe { plain::as_bytes(&header) })
             .unwrap();
         assert!(matches!(
-            Reader::new(&buffer),
+            Reader::new(&buffer, true),
             Err(ReaderError::MagicNumber)
         ));
     }
@@ -252,29 +272,39 @@ mod tests {
         buffer
             .write_all(unsafe { plain::as_bytes(&header) })
             .unwrap();
-        assert!(matches!(Reader::new(&buffer), Err(ReaderError::Version)));
+        assert!(matches!(
+            Reader::new(&buffer, true),
+            Err(ReaderError::Version)
+        ));
     }
 
     #[test]
     fn test_corrupt_unwind_info() {
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let path = PathBuf::from("/proc/self/exe");
-        let writer = Writer::new(&path);
+        let writer = Writer::new(&path, None);
         assert!(writer.write(&mut buffer).is_ok());
 
         // Corrupt unwind info.
         buffer.seek(SeekFrom::End(-10)).unwrap();
         buffer.write_all(&[0, 0, 0, 0, 0, 0, 0]).unwrap();
 
-        let reader = Reader::new(&buffer.get_ref()[..]);
+        let reader = Reader::new(&buffer.get_ref()[..], true);
         let unwind_info = reader.unwrap().unwind_info();
         assert!(matches!(unwind_info, Err(ReaderError::Digest)));
+
+        let reader = Reader::new(&buffer.get_ref()[..], false);
+        let unwind_info = reader.unwrap().unwind_info();
+        assert!(unwind_info.is_ok());
     }
 
     #[test]
     fn test_header_too_small() {
         let buffer = Vec::new();
-        assert!(matches!(Reader::new(&buffer), Err(ReaderError::OutOfRange)));
+        assert!(matches!(
+            Reader::new(&buffer, true),
+            Err(ReaderError::OutOfRange)
+        ));
     }
 
     #[test]
@@ -290,7 +320,7 @@ mod tests {
             .write_all(unsafe { plain::as_bytes(&header) })
             .unwrap();
         assert!(matches!(
-            Reader::new(&buffer).unwrap().unwind_info(),
+            Reader::new(&buffer, true).unwrap().unwind_info(),
             Err(ReaderError::OutOfRange)
         ));
     }

@@ -1,5 +1,6 @@
 use std::fs::read_to_string;
 use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::raw::c_int;
 use std::path::Path;
 use std::thread;
@@ -11,8 +12,8 @@ use crate::bpf::features_skel::FeaturesSkelBuilder;
 
 use anyhow::Result;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::MapHandle;
 use libbpf_rs::MapType;
+use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use libc::close;
 use nix::sys::utsname;
 use perf_event_open_sys as sys;
@@ -30,6 +31,7 @@ pub struct BpfFeatures {
     pub has_batch_map_operations: bool,
     pub has_mmapable_bpf_array: bool,
     pub has_task_pt_regs_helper: bool,
+    pub has_variable_inner_map: bool,
 }
 
 #[derive(Debug)]
@@ -78,7 +80,7 @@ fn get_trace_sched_event_id(trace_event: &str) -> Result<u32> {
         return Err(SystemInfoError::ErrorTracefsNotMounted.into());
     }
 
-    let event_id_path = format!("{}/events/sched/{}/id", TRACEFS_PATH, trace_event);
+    let event_id_path = format!("{TRACEFS_PATH}/events/sched/{trace_event}/id");
     let path = Path::new(&event_id_path);
     if !path.exists() {
         return Err(SystemInfoError::ErrorOpeningFile(event_id_path).into());
@@ -175,6 +177,56 @@ fn has_mmapable_bpf_array() -> bool {
     map.is_ok()
 }
 
+/// Attempts to create an inner map of variable size.
+fn has_variable_inner_map() -> bool {
+    let mut inner_maps = Vec::new();
+    let inner_opts = libbpf_sys::bpf_map_create_opts {
+        sz: size_of::<libbpf_sys::bpf_map_create_opts>() as libbpf_sys::size_t,
+        // We use inner mmapable arrays, so using the same flags here.
+        map_flags: libbpf_sys::BPF_F_INNER_MAP | libbpf_sys::BPF_F_MMAPABLE,
+        ..Default::default()
+    };
+    for max_entries in [10, 100, 10_000] {
+        let map = MapHandle::create(
+            MapType::Array,
+            Some(format!("inner_{max_entries}")),
+            4,
+            8,
+            max_entries,
+            &inner_opts,
+        )
+        .expect("create inner map");
+
+        inner_maps.push(map);
+    }
+
+    let outer_opts = libbpf_sys::bpf_map_create_opts {
+        sz: size_of::<libbpf_sys::bpf_map_create_opts>() as libbpf_sys::size_t,
+        // The outer map requires an inner map to initialise its metadata.
+        inner_map_fd: inner_maps.first().unwrap().as_fd().as_raw_fd() as u32,
+        ..Default::default()
+    };
+    let outer = MapHandle::create(
+        MapType::HashOfMaps,
+        Some("outer".to_string()),
+        8,
+        4,
+        10_000,
+        &outer_opts,
+    )
+    .expect("create outer map");
+
+    for (i, inner_map) in inner_maps.iter().enumerate() {
+        let key = i.to_ne_bytes();
+        let value = inner_map.as_fd().as_raw_fd().to_ne_bytes();
+        if outer.update(&key, &value, MapFlags::ANY).is_err() {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn check_bpf_features() -> Result<BpfFeatures> {
     let skel_builder = FeaturesSkelBuilder::default();
     let mut a = MaybeUninit::uninit();
@@ -211,6 +263,7 @@ fn check_bpf_features() -> Result<BpfFeatures> {
         has_batch_map_operations: bpf_features_bss.has_batch_map_operations,
         has_mmapable_bpf_array: has_mmapable_bpf_array(),
         has_task_pt_regs_helper: bpf_features_bss.has_task_pt_regs_helper,
+        has_variable_inner_map: has_variable_inner_map(),
     };
 
     Ok(features)
@@ -243,6 +296,9 @@ impl SystemInfo {
             && self.tracepoints_support_detected
             && bpf_features.can_load_trivial_bpf_program
             && bpf_features.has_tail_call
+            && bpf_features.has_map_of_maps
+            && bpf_features.has_mmapable_bpf_array
+            && bpf_features.has_variable_inner_map
     }
 }
 

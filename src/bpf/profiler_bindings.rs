@@ -9,9 +9,6 @@ use crate::unwind_info::types::CompactUnwindRow;
 
 include!(concat!(env!("OUT_DIR"), "/profiler_bindings.rs"));
 
-unsafe impl Plain for stack_sample_t {}
-unsafe impl Plain for stack_key_t {}
-unsafe impl Plain for native_stack_t {}
 unsafe impl Plain for Event {}
 unsafe impl Plain for unwinder_stats_t {}
 unsafe impl Plain for exec_mappings_key {}
@@ -24,9 +21,7 @@ impl exec_mappings_key {
         let key_size_bits = std::mem::size_of::<Self>() * 8;
         assert!(
             prefix_len <= key_size_bits.try_into().unwrap(),
-            "prefix_len {} should be <= than the size of exec_mappings_key {}",
-            prefix_len,
-            key_size_bits
+            "prefix_len {prefix_len} should be <= than the size of exec_mappings_key {key_size_bits}"
         );
 
         Self {
@@ -51,9 +46,10 @@ impl Add for unwinder_stats_t {
                 + other.error_unsupported_frame_pointer_action,
             error_unsupported_cfa_register: self.error_unsupported_cfa_register
                 + other.error_unsupported_cfa_register,
+            error_previous_rsp_read: self.error_previous_rsp_read + other.error_previous_rsp_read,
             error_previous_rsp_zero: self.error_previous_rsp_zero + other.error_previous_rsp_zero,
             error_previous_rip_zero: self.error_previous_rip_zero + other.error_previous_rip_zero,
-            error_previous_rbp_zero: self.error_previous_rbp_zero + other.error_previous_rbp_zero,
+            error_previous_rbp_read: self.error_previous_rbp_read + other.error_previous_rbp_read,
             error_should_never_happen: self.error_should_never_happen
                 + other.error_should_never_happen,
             error_binary_search_exhausted_iterations: self.error_binary_search_exhausted_iterations

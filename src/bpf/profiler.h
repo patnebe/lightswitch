@@ -20,8 +20,8 @@ _Static_assert(MAX_TAIL_CALLS *MAX_STACK_DEPTH_PER_PROGRAM >= MAX_STACK_DEPTH,
 #define MAX_MAPPINGS MAX_PROCESSES * 200
 // Binary search iterations to find unwind information.
 #define MAX_BINARY_SEARCH_DEPTH 17
-// Number of entries in the outer unwind map.
-#define MAX_OUTER_UNWIND_MAP_ENTRIES 500
+// Number of entries in the 'outer' unwind map.
+#define MAX_OUTER_UNWIND_MAP_ENTRIES 3000
 
 #define UNWIND_INFO_PAGE_BIT_LEN 16
 #define UNWIND_INFO_PAGE_SIZE (1 << UNWIND_INFO_PAGE_BIT_LEN)
@@ -45,33 +45,28 @@ typedef struct {
 } page_key_t;
 
 typedef struct {
-  u32 bucket_id;
   u32 low_index;
   u32 high_index;
 } page_value_t;
 
-
-// Values for dwarf expressions.
-#define DWARF_EXPRESSION_UNKNOWN 0
-#define DWARF_EXPRESSION_PLT1 1
-#define DWARF_EXPRESSION_PLT2 2
-
 // Values for the unwind table's CFA type.
-#define CFA_TYPE_RBP 1
-#define CFA_TYPE_RSP 2
-#define CFA_TYPE_EXPRESSION 3
-// Special values.
-#define CFA_TYPE_END_OF_FDE_MARKER 4
-#define CFA_TYPE_OFFSET_DID_NOT_FIT 5
+#define CFA_TYPE_RBP                    1
+#define CFA_TYPE_RSP                    2
+#define CFA_TYPE_CFA_TYPE_UNSUP_EXP     3
+#define CFA_TYPE_PLT1                   4
+#define CFA_TYPE_PLT2                   5
+#define CFA_TYPE_DEREF_AND_ADD          6
+#define CFA_TYPE_END_OF_FDE_MARKER      7
+#define CFA_TYPE_UNSUP_REGISTER_OFFSET  8   // not used in the unwinder yet.
+#define CFA_TYPE_OFFSET_DID_NOT_FIT     9
 
 // Values for the unwind table's frame pointer type.
-#define RBP_TYPE_UNCHANGED 0
-#define RBP_TYPE_OFFSET 1
-#define RBP_TYPE_REGISTER 2
-#define RBP_TYPE_EXPRESSION 3
-// Special values.
+#define RBP_TYPE_UNCHANGED                0
+#define RBP_TYPE_OFFSET                   1
+#define RBP_TYPE_REGISTER                 2
+#define RBP_TYPE_EXPRESSION               3
 #define RBP_TYPE_UNDEFINED_RETURN_ADDRESS 4
-#define RBP_TYPE_OFFSET_DID_NOT_FIT 5
+#define RBP_TYPE_OFFSET_DID_NOT_FIT       5
 
 // Binary search error codes.
 #define BINARY_SEARCH_DEFAULT 0xFABADAFABADAULL
@@ -92,9 +87,10 @@ struct unwinder_stats_t {
   u64 error_unsupported_expression;
   u64 error_unsupported_frame_pointer_action;
   u64 error_unsupported_cfa_register;
+  u64 error_previous_rsp_read;
   u64 error_previous_rsp_zero;
   u64 error_previous_rip_zero;
-  u64 error_previous_rbp_zero;
+  u64 error_previous_rbp_read;
   u64 error_should_never_happen;
   u64 error_mapping_not_found;
   u64 error_mapping_does_not_contain_pc;
@@ -153,34 +149,32 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(stack_unwind_row_t) == 8,
                "unwind row has the expected size");
 
+
+
 // The addresses of a native stack trace.
 typedef struct {
-  u64 len;
-  u64 addresses[MAX_STACK_DEPTH];
+  u32 ulen;
+  u32 klen;
+  // Needed as the verifier won't operate with dynamically computed offsets and
+  // wants to ensure that any write won't be out of bounds. Note that only the
+  // actual unwound stack will be sent to userspace.
+  u64 addresses[MAX_STACK_DEPTH * 2];
 } native_stack_t;
 
 typedef struct {
-  int task_id;
   int pid;
-  // offset since system boot
+  int tid;
   u64 collected_at;
-} stack_key_t;
-
-typedef struct {
-  stack_key_t    stack_key;
   native_stack_t stack;
-  native_stack_t kernel_stack;
-} stack_sample_t;
+} sample_t;
 
 typedef struct {
-  stack_sample_t stack;
-
   unsigned long long ip;
   unsigned long long sp;
   unsigned long long bp;
   unsigned long long lr;
-  int tail_calls;
-
+  u64 tail_calls;
+  sample_t sample;
 } unwind_state_t;
 
 enum event_type {
